@@ -15,6 +15,7 @@ import { navigate, domainAllowed, hostOf } from "./navigator.js";
 import { isToolError, resultText } from "./observe.js";
 import { BudgetExceeded } from "./client.js";
 import { buildQuestions, questionsError, compactAnswer } from "./questions.js";
+import { EVIDENCE_SUFFIX, splitPassages, numberedText, evidenceQuestions, pickEvidence } from "./evidence.js";
 
 // Re-exported: callers and tests reached these through this module first.
 export { buildQuestions, questionsError, compactAnswer };
@@ -181,7 +182,7 @@ export async function assess(callTool, client, cfg, args) {
   const {
     tabId, questions, context = "", selector,
     max_chars: maxChars = 4000, return_chars: returnChars = 300,
-    allow_sensitive: allowSensitive = false
+    allow_sensitive: allowSensitive = false, evidence: withEvidence = true
   } = args;
   const startedAt = Date.now();
   const deadline = startedAt + (args.max_ms ?? Math.max(cfg.maxMs, 180000));
@@ -217,6 +218,9 @@ export async function assess(callTool, client, cfg, args) {
   let stopped = null;
 
   const judge = async (item, page) => {
+    // With evidence on, Jev reads the page as numbered passages and names the
+    // one behind each answer, which comes back verbatim.
+    const passages = withEvidence ? splitPassages(page.text) : null;
     const state = {
       context,
       item: {
@@ -224,12 +228,19 @@ export async function assess(callTool, client, cfg, args) {
         ...(item.context ? { context: item.context } : {}),
         ...(page.url ? { url: page.url } : {}),
         ...(page.title ? { title: page.title } : {}),
-        text: page.text
+        text: passages ? numberedText(passages) : page.text
       }
     };
-    const { answers } = await client.decide(state, jevQuestions);
+    const asked = passages ? { ...jevQuestions, ...evidenceQuestions(questions, passages.length) } : jevQuestions;
+    const { answers } = await client.decide(state, asked);
     const compact = {};
-    for (const q of questions) compact[q.key] = compactAnswer(answers[q.key]);
+    for (const q of questions) {
+      compact[q.key] = compactAnswer(answers[q.key]);
+      if (passages && compact[q.key]) {
+        const quote = pickEvidence(answers[q.key + EVIDENCE_SUFFIX], passages);
+        if (quote) compact[q.key].evidence = quote;
+      }
+    }
     return compact;
   };
 

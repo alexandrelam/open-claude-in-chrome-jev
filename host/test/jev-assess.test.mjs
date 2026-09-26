@@ -13,6 +13,7 @@ import { assess, buildQuestions, questionsError, compactAnswer, summarize, colla
 import { requestTimeoutMs } from "../tool-runtime.js";
 import { resolveConfig } from "../jev/config.js";
 import { BudgetExceeded } from "../jev/client.js";
+import { splitPassages, numberedText, evidenceQuestions, pickEvidence } from "../jev/evidence.js";
 
 const results = [];
 async function check(name, fn) {
@@ -216,7 +217,7 @@ await check("page text is de-duplicated before Jev sees it", async () => {
   const browser = fakeBrowser({ "https://x.test/p": "Iphone 16 Iphone 16 Iphone 16 500 €" });
   const client = fakeClient(answerByText);
   await assess(browser.callTool, client, CFG, { tabId: 1, items: [{ url: "https://x.test/p" }], questions: QUESTIONS });
-  eq(client.seen[0].state.item.text, "Iphone 16 500 €", "Jev reads one copy");
+  eq(client.seen[0].state.item.text, "[1] Iphone 16 500 €", "Jev reads one copy");
 });
 
 await check("items_script items are appended and judged in the same call", async () => {
@@ -365,6 +366,82 @@ await check("a where on an unknown question is refused before browsing", async (
     tabId: 1, items: [{ url: "https://x.test/1" }], questions: QUESTIONS, where: [{ key: "invoice" }]
   });
   assert(/needs yes_above/.test(noTest.reason), `reason: ${noTest.reason}`);
+});
+
+
+// --- Evidence: the passage behind each answer, quoted from the page ---
+
+const AD = "Studio de 27m² rue Albert, entre la ligne 14 (Olympiades) et le tramway. " +
+  "Il dispose d'une cuisine équipée et d'une salle d'eau. Le loyer est de 1 050 € / mois cc. " +
+  "Équipements (6) Plaques de cuisson Four Frigo Lave-linge Douche Mobilier bail meublé";
+
+/** A fake Jev that also names passages: the first one matching each pattern. */
+const answerWithEvidence = (patterns) => (state, questions) => {
+  const lines = state.item.text.split("\n");
+  const out = {
+    invoice: { type: "noul", noul: 0.9 },
+    deal: { type: "choice", choice: "great", probabilities: { great: 0.8, fair: 0.2 } }
+  };
+  for (const key of Object.keys(questions).filter((k) => k.endsWith("__evidence"))) {
+    const re = patterns[key.replace("__evidence", "")];
+    const hit = re ? lines.findIndex((l) => re.test(l)) : -1;
+    const choice = hit >= 0 ? `p${hit + 1}` : "none";
+    out[key] = { type: "choice", choice, probabilities: { [choice]: 0.9, none: 0.1 } };
+  }
+  return out;
+};
+
+await check("passages keep the page's words, in order, and fit a choice question", async () => {
+  const ps = splitPassages(AD);
+  assert(ps.length >= 3, `split into ${ps.length}`);
+  eq(ps.join(" ").replace(/\s+/g, " "), AD.replace(/\s+/g, " "), "nothing added, dropped or reordered");
+  assert(ps.every((p) => p.length <= 280), "no passage over the cap");
+  const long = Array.from({ length: 1200 }, (_, i) => `Phrase numéro ${i} du texte.`).join(" ");
+  const many = splitPassages(long);
+  assert(many.length <= 254, `${many.length} passages fits 255 options with "none"`);
+  eq(many.join(" "), long, "pairing keeps every word");
+  eq(splitPassages("").length, 0, "empty text, no passages");
+});
+
+await check("every question gets a companion over the numbered passages", async () => {
+  const ps = splitPassages(AD);
+  const q = evidenceQuestions(QUESTIONS, ps.length);
+  eq(Object.keys(q).sort().join(","), "deal__evidence,invoice__evidence", "one per question");
+  eq(Object.keys(q.invoice__evidence.criteria).length, ps.length + 1, "a passage per option, plus none");
+  assert(q.deal__evidence.instructions.includes("How good is the price?"), "names the question it backs");
+  assert(numberedText(ps).startsWith("[1] Studio"), "Jev reads passages behind their numbers");
+});
+
+await check("answers come back with the passage they rest on, verbatim", async () => {
+  const client = fakeClient(answerWithEvidence({ invoice: /Lave-linge/, deal: /loyer/ }));
+  const out = await assess(fakeBrowser({}).callTool, client, CFG, { items: [{ text: AD }], questions: QUESTIONS });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  const a = out.items[0].answers;
+  assert(a.invoice.evidence.includes("Lave-linge"), `invoice evidence: ${a.invoice.evidence}`);
+  assert(AD.includes(a.invoice.evidence), "quoted as it stands on the page");
+  assert(a.deal.evidence.includes("1 050 €"), `deal evidence: ${a.deal.evidence}`);
+  eq(a.invoice.yes, 0.9, "the answer itself is unchanged");
+  eq(client.seen.length, 1, "evidence rides in the same request");
+});
+
+await check("no evidence when Jev finds none, and none asked when turned off", async () => {
+  const client = fakeClient(answerWithEvidence({}));
+  const out = await assess(fakeBrowser({}).callTool, client, CFG, { items: [{ text: AD }], questions: QUESTIONS });
+  eq(out.items[0].answers.invoice.evidence, undefined, "none -> no quote");
+  const off = fakeClient(answerByText);
+  await assess(fakeBrowser({}).callTool, off, CFG, { items: [{ text: AD }], questions: QUESTIONS, evidence: false });
+  eq(Object.keys(off.seen[0].questions).join(","), "invoice,deal", "only Claude's questions");
+  eq(off.seen[0].state.item.text, AD, "plain text, no numbers");
+});
+
+await check("a close runner-up passage is quoted too, and a bad pick is ignored", async () => {
+  const ps = ["Cuisine équipée avec lave-linge.", "Équipements : Lave-linge Douche", "Loyer 1 050 €"];
+  eq(pickEvidence({ type: "choice", choice: "p1", probabilities: { p1: 0.6, p2: 0.3, none: 0.1 } }, ps),
+    "Cuisine équipée avec lave-linge. … Équipements : Lave-linge Douche", "two places");
+  eq(pickEvidence({ type: "choice", choice: "p1", probabilities: { p1: 0.9, p3: 0.1 } }, ps), ps[0], "a weak runner-up is dropped");
+  eq(pickEvidence({ type: "choice", choice: "p9", probabilities: { p9: 1 } }, ps), null, "out of range");
+  eq(pickEvidence(undefined, ps), null, "missing answer");
+  assert(questionsError([{ key: "a__evidence", type: "yes_no", question: "q" }]), "the suffix is reserved");
 });
 
 const failed = results.filter((r) => !r.ok);

@@ -37,6 +37,8 @@ export function questionsError(questions) {
     if (keys.has(q.key)) return `Question key "${q.key}" is used twice.`;
     // The client reads a bare response's own fields under these names.
     if (RESERVED_KEYS.has(q.key)) return `Question key "${q.key}" is reserved; use another name.`;
+    // Evidence rides along as a companion question under this suffix.
+    if (q.key.endsWith("__evidence")) return `Question key "${q.key}" ends in "__evidence", which is reserved; use another name.`;
     keys.add(q.key);
     if (!q.question) return `Question "${q.key}" has no text.`;
     if (q.type === "choice" && (!q.options || Object.keys(q.options).length < 2)) {

@@ -106,7 +106,7 @@ export const JEV_TOOLS = [
   {
     name: "jev_assess",
     description:
-      "Ask Jev YOUR questions about many items in one call, and read every answer at the end in one table. Use it whenever you would otherwise open or read items one by one to judge them: listings, profiles, search results, rows of data. Each item is a page to open (`url`), text you already have (`text`), or a page reached by first running a navigation `goal` (the same loop as jev_navigate). Questions are yes_no, choice or score, and Jev answers each with a probability — it never writes text. Put the facts a page cannot know, and your rules for judging, in `context` (e.g. today's new price and what counts as a good deal): Jev applies them to every item. Items can also come from `items_script`, a script run on the page that returns them, so a list you would otherwise extract first is built and judged in the same call. Returns a per-question summary plus one row per item with the answers and a short excerpt, so you can check the doubtful ones yourself.",
+      "Ask Jev YOUR questions about many items in one call, and read every answer at the end in one table. Use it whenever you would otherwise open or read items one by one to judge them: listings, profiles, search results, rows of data. Each item is a page to open (`url`), text you already have (`text`), or a page reached by first running a navigation `goal` (the same loop as jev_navigate). Questions are yes_no, choice or score, and Jev answers each with a probability — it never writes text. Put the facts a page cannot know, and your rules for judging, in `context` (e.g. today's new price and what counts as a good deal): Jev applies them to every item. Items can also come from `items_script`, a script run on the page that returns them, so a list you would otherwise extract first is built and judged in the same call. Returns a per-question summary plus one row per item. Each answer carries `evidence`: the passage of the page it rests on, quoted verbatim, so you can check an answer, and read the names and figures behind it, without opening the page again.",
     paramShape: {
       items: z
         .array(
@@ -153,7 +153,8 @@ export const JEV_TOOLS = [
         .describe("Return only the rows that pass every condition, e.g. [{key:'available', yes_above:0.5}]. The summary still counts every item, rows that failed to load are always returned, and the rest are listed by label under filtered_out. Use it on long lists so you read the matches, not the whole table."),
       selector: z.string().optional().describe("CSS selector of the part of each page to read. Default: <main>, else the body. Hidden text (collapsed panels, closed tabs) is read too."),
       max_chars: z.number().optional().describe("Page text sent to Jev per item (default 4000)."),
-      return_chars: z.number().optional().describe("Excerpt of each item's text returned to you (default 300, 0 for none)."),
+      return_chars: z.number().optional().describe("Excerpt of each item's text returned to you, from the top of the page (default 300, 0 for none). With `evidence` on you rarely need more."),
+      evidence: z.boolean().optional().describe("Quote, with each answer, the passage of the page it rests on (default true). Jev picks the passage by number and the server returns it verbatim; turn it off only to save tokens on very long question lists."),
       max_ms: z.number().optional().describe("Wall-clock budget for the whole call (default 180000). Items past it are reported as skipped."),
       allow_sensitive: z.boolean().optional().describe("For items with a `goal`: permit actions that look irreversible. Default false.")
     }
