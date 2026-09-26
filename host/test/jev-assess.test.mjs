@@ -9,7 +9,7 @@
 //
 // Run: node host/test/jev-assess.test.mjs
 
-import { assess, buildQuestions, questionsError, compactAnswer, summarize, collapseRepeats } from "../jev/assess.js";
+import { assess, buildQuestions, questionsError, compactAnswer, summarize, collapseRepeats, readPageExpression, rowMatches } from "../jev/assess.js";
 import { requestTimeoutMs } from "../tool-runtime.js";
 import { resolveConfig } from "../jev/config.js";
 import { BudgetExceeded } from "../jev/client.js";
@@ -264,6 +264,107 @@ await check("the host waits longer only for a javascript_tool that asks for it",
   eq(requestTimeoutMs("javascript_tool", { timeout_ms: 90000 }), 100000, "extended with slack");
   eq(requestTimeoutMs("javascript_tool", { timeout_ms: 999999 }), 130000, "capped");
   eq(requestTimeoutMs("navigate", { timeout_ms: 90000 }), 60000, "other tools untouched");
+});
+
+await check("there is no item limit", async () => {
+  const items = Array.from({ length: 64 }, (_, i) => ({ text: `offre ${i}`, label: `ad${i}` }));
+  const out = await assess(fakeBrowser({}).callTool, fakeClient(answerByText), CFG, { items, questions: QUESTIONS });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(out.items.length, 64, "every item judged");
+});
+
+/**
+ * Just enough DOM to run the page-reading expression: elements with tagName and
+ * children, text nodes with nodeValue, and a TreeWalker honouring
+ * FILTER_REJECT (skip the subtree) and FILTER_SKIP (skip the node, keep its
+ * children).
+ */
+const NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3 };
+const h = (tagName, ...children) => ({ nodeType: 1, tagName, children: children.map((c) => (typeof c === "string" ? { nodeType: 3, nodeValue: c } : c)) });
+function runReadPage(root, selector = "") {
+  const document = {
+    title: "T",
+    querySelector: (s) => (s === "main" ? root : null),
+    createTreeWalker: (start, _show, filter) => {
+      const order = [];
+      const visit = (n) => {
+        for (const c of n.children ?? []) {
+          const verdict = filter.acceptNode(c);
+          if (verdict === NodeFilter.FILTER_ACCEPT) order.push(c);
+          if (verdict !== NodeFilter.FILTER_REJECT) visit(c);
+        }
+      };
+      visit(start);
+      let i = 0;
+      return { nextNode: () => order[i++] ?? null };
+    }
+  };
+  const expr = readPageExpression(selector, 4000);
+  return new Function("document", "NodeFilter", "location", `return ${expr}`)(document, NodeFilter, { href: "https://x.test/ad" });
+}
+
+await check("hidden text is read, script and style are not", async () => {
+  // 123loger: the equipment list sits in a collapsed panel innerText never sees.
+  const page = h("MAIN",
+    h("H1", "Beau 2P 21m²"),
+    h("DIV", h("UL", h("LI", "Plaques de cuisson"), h("LI", "Lave-linge"))),
+    h("SCRIPT", "window.tracking = 1"),
+    h("STYLE", ".x{display:none}"),
+    h("SVG", h("TITLE", "icon"))
+  );
+  const out = runReadPage(page);
+  eq(out.text, "Beau 2P 21m² Plaques de cuisson Lave-linge", "text nodes in order, junk skipped");
+  eq(out.url, "https://x.test/ad", "url");
+  assert(!/innerText/.test(readPageExpression("", 4000)), "does not read through innerText");
+});
+
+await check("items_script runs on its own page, after it settles", async () => {
+  const calls = [];
+  const callTool = async (name, args) => {
+    calls.push(name === "navigate" ? `navigate ${args.url}` : name === "jev_settle" ? `settle ${args.expect}` : name);
+    return name === "javascript_tool" ? text(JSON.stringify([{ text: "400 facture" }])) : text("ok");
+  };
+  const out = await assess(callTool, fakeClient(answerByText), CFG, {
+    tabId: 1, items_script: "BUILD", items_script_url: "https://x.test/listing", questions: QUESTIONS
+  });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(calls.slice(0, 3).join(" | "), "navigate https://x.test/listing | settle quiet | javascript_tool", "open, settle, then run");
+
+  const blocked = fakeBrowser({});
+  const refused = await assess(blocked.callTool, fakeClient(answerByText), { ...CFG, blockedDomains: ["bank.test"] }, {
+    tabId: 1, items_script: "BUILD", items_script_url: "https://bank.test/x", questions: QUESTIONS
+  });
+  eq(refused.status, "error", "blocked listing refused");
+  eq(blocked.calls.length, 0, "never opened");
+});
+
+await check("where returns the matches, keeps failures, and lists the rest", async () => {
+  const browser = fakeBrowser({ "https://x.test/1": "offre 400 facture", "https://x.test/2": "offre 600", "https://x.test/3": "" });
+  const out = await assess(browser.callTool, fakeClient(answerByText), CFG, {
+    tabId: 1,
+    items: [{ url: "https://x.test/1", label: "good" }, { url: "https://x.test/2", label: "bad" }, { url: "https://x.test/3", label: "broken" }],
+    questions: QUESTIONS,
+    where: [{ key: "invoice", yes_above: 0.5 }, { key: "deal", choice_in: ["great", "fair"] }]
+  });
+  eq(out.items.map((r) => r.label).join(","), "good,broken", "the match and the failure");
+  eq(out.filtered_out.count, 1, "one filtered");
+  eq(out.filtered_out.labels[0], "bad", "named");
+  eq(out.summary.invoice.no, 1, "summary still counts the filtered row");
+  assert(rowMatches({ status: "ok", answers: { s: { score: 2 } } }, [{ key: "s", score_at_least: 2 }]), "score threshold inclusive");
+  assert(!rowMatches({ status: "ok", answers: {} }, [{ key: "s", score_at_least: 0 }]), "a missing answer fails");
+});
+
+await check("a where on an unknown question is refused before browsing", async () => {
+  const browser = fakeBrowser({});
+  const out = await assess(browser.callTool, fakeClient(answerByText), CFG, {
+    tabId: 1, items: [{ url: "https://x.test/1" }], questions: QUESTIONS, where: [{ key: "nope", yes_above: 0.5 }]
+  });
+  eq(out.status, "error", "status");
+  eq(browser.calls.length, 0, "nothing opened");
+  const noTest = await assess(browser.callTool, fakeClient(answerByText), CFG, {
+    tabId: 1, items: [{ url: "https://x.test/1" }], questions: QUESTIONS, where: [{ key: "invoice" }]
+  });
+  assert(/needs yes_above/.test(noTest.reason), `reason: ${noTest.reason}`);
 });
 
 const failed = results.filter((r) => !r.ok);

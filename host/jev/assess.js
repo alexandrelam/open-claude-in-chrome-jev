@@ -19,7 +19,8 @@ import { buildQuestions, questionsError, compactAnswer } from "./questions.js";
 // Re-exported: callers and tests reached these through this module first.
 export { buildQuestions, questionsError, compactAnswer };
 
-export const MAX_ITEMS = 50;
+// No cap on the number of items: max_ms and the Jev budget already bound the
+// work, and `where` bounds what comes back to Claude.
 const TEXT_CONCURRENCY = 4;
 
 /** Totals per question across items, so the table can be read top-down. */
@@ -52,17 +53,39 @@ export function collapseRepeats(text) {
 }
 
 /**
- * The page's readable text, from the element Claude named (or <main>, or the
- * body). Read through javascript_tool so a client-rendered page (a leboncoin
- * profile renders its rating after load) is read as the user sees it; the
- * selector is Claude's, never Jev's.
+ * The page's text, from the element Claude named (or <main>, or the body).
+ * Read through javascript_tool so a client-rendered page (a leboncoin profile
+ * renders its rating after load) is read after it renders; the selector is
+ * Claude's, never Jev's.
+ *
+ * Every text node is read, hidden ones included. innerText drops anything under
+ * display:none, and ads keep their details in collapsed panels: 123loger lists
+ * "Lave-linge" only in the closed "Voir toutes les caractéristiques" block, so
+ * Jev answered "not mentioned" with full confidence. Script, style and other
+ * non-text subtrees are skipped.
  */
-async function readPage(callTool, tabId, selector, maxChars) {
+export function readPageExpression(selector, maxChars) {
   const sel = JSON.stringify(selector || "");
-  const expr = `(() => {
+  return `(() => {
     const el = (${sel} && document.querySelector(${sel})) || document.querySelector('main') || document.body;
-    return { url: location.href, title: document.title, text: (el ? el.innerText : '').replace(/\\s+/g, ' ').trim().slice(0, ${Number(maxChars) * 3}) };
+    let text = '';
+    if (el) {
+      const skip = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'IFRAME', 'OBJECT']);
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => n.nodeType === 1
+          ? (skip.has(n.tagName.toUpperCase()) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP)
+          : NodeFilter.FILTER_ACCEPT
+      });
+      const parts = [];
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) parts.push(n.nodeValue);
+      text = parts.join(' ').replace(/\\s+/g, ' ').trim().slice(0, ${Number(maxChars) * 3});
+    }
+    return { url: location.href, title: document.title, text };
   })()`;
+}
+
+async function readPage(callTool, tabId, selector, maxChars) {
+  const expr = readPageExpression(selector, maxChars);
   // A page that renders after load answers with an empty element at first;
   // three short retries cover it without a fixed sleep on every page.
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -122,6 +145,37 @@ async function scriptItems(callTool, tabId, code, timeoutMs) {
   return { items: value };
 }
 
+/**
+ * Does a judged row pass every `where` condition? Conditions are ANDed, and a
+ * row missing the answer fails. Rows that were not judged (errors, skips,
+ * blocks) are never filtered: Claude has to see what went wrong.
+ */
+export function rowMatches(row, where) {
+  if (!where?.length || row.status !== "ok") return true;
+  return where.every((c) => {
+    const a = row.answers?.[c.key];
+    if (!a) return false;
+    if (c.yes_above != null && !(a.yes > c.yes_above)) return false;
+    if (c.choice_in != null && !c.choice_in.includes(a.choice)) return false;
+    if (c.score_at_least != null && !(a.score >= c.score_at_least)) return false;
+    return true;
+  });
+}
+
+/** A `where` that names an unknown question or no test is refused up front. */
+function whereError(where, questions) {
+  if (where == null) return null;
+  if (!Array.isArray(where)) return "`where` must be a list of conditions.";
+  const keys = new Set(questions.map((q) => q.key));
+  for (const c of where) {
+    if (!keys.has(c?.key)) return `\`where\` names "${c?.key}", which is not one of the questions.`;
+    if (c.yes_above == null && c.choice_in == null && c.score_at_least == null) {
+      return `\`where\` on "${c.key}" needs yes_above, choice_in or score_at_least.`;
+    }
+  }
+  return null;
+}
+
 /** Backs the jev_assess tool. */
 export async function assess(callTool, client, cfg, args) {
   const {
@@ -132,17 +186,27 @@ export async function assess(callTool, client, cfg, args) {
   const startedAt = Date.now();
   const deadline = startedAt + (args.max_ms ?? Math.max(cfg.maxMs, 180000));
 
-  const qErr = questionsError(questions);
+  const qErr = questionsError(questions) ?? whereError(args.where, questions);
   if (qErr) return { status: "error", reason: qErr };
   let items = args.items ?? [];
   if (args.items_script) {
     if (typeof tabId !== "number") return { status: "error", reason: "items_script needs a tabId to run in." };
+    // The script runs on its own page, not wherever a previous call left the
+    // tab, and only once that page has rendered: a listing that draws its
+    // cards after load otherwise hands the script an empty page.
+    if (args.items_script_url) {
+      if (!domainAllowed(args.items_script_url, cfg)) {
+        return { status: "error", reason: `${hostOf(args.items_script_url)} is outside jev.allowed_domains / in jev.blocked_domains.` };
+      }
+      const res = await callTool("navigate", { url: args.items_script_url, tabId });
+      if (isToolError(res)) return { status: "error", reason: `items_script_url: ${resultText(res)}` };
+    }
+    await callTool("jev_settle", { tabId, expect: "quiet" });
     const built = await scriptItems(callTool, tabId, args.items_script, args.items_script_timeout_ms);
     if (built.error) return { status: "error", reason: built.error };
     items = [...items, ...built.items];
   }
   if (!items.length) return { status: "error", reason: "No items to assess." };
-  if (items.length > MAX_ITEMS) return { status: "error", reason: `At most ${MAX_ITEMS} items per call; got ${items.length}.` };
   const bare = items.findIndex((it) => !it.url && !it.goal && it.text == null);
   if (bare >= 0) return { status: "error", reason: `Item ${bare + 1} has no url, goal or text to assess.` };
   if (items.some((it) => (it.url || it.goal) && typeof tabId !== "number")) {
@@ -192,7 +256,16 @@ export async function assess(callTool, client, cfg, args) {
             values: item.values, start_url: item.url, allow_sensitive: allowSensitive,
             max_steps: item.max_steps, max_ms: Math.max(1000, deadline - Date.now())
           });
-          row.navigation = { status: nav.status, steps: nav.steps.length, ...(nav.reason ? { reason: nav.reason } : {}) };
+          // The page is read whatever the loop's outcome. A loop that acted and
+          // then stopped short (a click opened the panel, then a low-confidence
+          // WAIT) is partial, not a failure: its page is usually the right one,
+          // and the answers say so better than the loop's status.
+          const status = nav.status === "done" ? "done" : nav.steps.length ? "partial" : "failed";
+          row.navigation = {
+            status, steps: nav.steps.length,
+            ...(status !== "done" ? { stopped_as: nav.status } : {}),
+            ...(nav.reason ? { reason: nav.reason } : {})
+          };
         } else {
           const res = await callTool("navigate", { url: item.url, tabId });
           if (isToolError(res)) return { ...row, status: "error", reason: resultText(res) };
@@ -229,11 +302,16 @@ export async function assess(callTool, client, cfg, args) {
   for (const i of pageIdx) rows[i] = await assessOne(items[i], i);
 
   const done = rows.filter((r) => r.status === "ok").length;
+  // The summary counts every item; `where` only trims the rows sent back, so a
+  // big list costs Claude the matches rather than the whole table.
+  const kept = rows.filter((r) => rowMatches(r, args.where));
+  const dropped = rows.filter((r) => !rowMatches(r, args.where));
   return {
     status: done === rows.length ? "done" : done === 0 ? "failed" : "partial",
     ...(stopped ? { reason: stopped } : {}),
     summary: summarize(rows, questions),
-    items: rows,
+    items: kept,
+    ...(dropped.length ? { filtered_out: { count: dropped.length, labels: dropped.map((r) => r.label ?? r.url ?? `#${r.i}`) } } : {}),
     usage: { ...client.totals, wall_ms: Date.now() - startedAt }
   };
 }

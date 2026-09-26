@@ -122,11 +122,15 @@ export const JEV_TOOLS = [
           })
         )
         .optional()
-        .describe(`Up to ${50} items, counting any from items_script. Text items run in parallel; items that open pages share the tab and run in order.`),
+        .describe("Any number of items; max_ms and the Jev budget bound the run, and `where` bounds the rows returned. Text items run in parallel; items that open pages share the tab and run in order."),
       items_script: z
         .string()
         .optional()
         .describe("JavaScript run in `tabId` (top-level await allowed) whose last expression is an array of items shaped like `items` (e.g. [{url, label, context}] built from the page's data). They are appended to `items`, so extracting the list and judging it takes one call instead of two."),
+      items_script_url: z
+        .string()
+        .optional()
+        .describe("Page to open before items_script runs, e.g. the listing, so the script never runs on wherever an earlier call left the tab. With or without it, the script waits for the page to stop rendering first."),
       items_script_timeout_ms: z.number().optional().describe("How long items_script may run, in ms (default 20000, max 120000)."),
       questions: z
         .array(QUESTION)
@@ -136,7 +140,18 @@ export const JEV_TOOLS = [
         .optional()
         .describe("Shared facts and rules applied to every item, e.g. 'New price today: 128 Go 527 €, 256 Go 680 €. A good deal is 15% or more below new, with an invoice.'"),
       tabId: z.number().optional().describe("Tab to browse in. Required when any item has a url or goal."),
-      selector: z.string().optional().describe("CSS selector of the part of each page to read. Default: <main>, else the body."),
+      where: z
+        .array(
+          z.object({
+            key: z.string().describe("A question's key."),
+            yes_above: z.number().optional().describe("yes_no: keep when P(yes) is above this, e.g. 0.5."),
+            choice_in: z.array(z.string()).optional().describe("choice: keep when the chosen option is one of these."),
+            score_at_least: z.number().optional().describe("score: keep when the score is at least this (0 = first label).")
+          })
+        )
+        .optional()
+        .describe("Return only the rows that pass every condition, e.g. [{key:'available', yes_above:0.5}]. The summary still counts every item, rows that failed to load are always returned, and the rest are listed by label under filtered_out. Use it on long lists so you read the matches, not the whole table."),
+      selector: z.string().optional().describe("CSS selector of the part of each page to read. Default: <main>, else the body. Hidden text (collapsed panels, closed tabs) is read too."),
       max_chars: z.number().optional().describe("Page text sent to Jev per item (default 4000)."),
       return_chars: z.number().optional().describe("Excerpt of each item's text returned to you (default 300, 0 for none)."),
       max_ms: z.number().optional().describe("Wall-clock budget for the whole call (default 180000). Items past it are reported as skipped."),
