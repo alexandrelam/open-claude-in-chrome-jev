@@ -18,6 +18,7 @@ if [ -z "$1" ]; then
   echo "Each browser assigns a different ID to the same unpacked extension."
   echo ""
   echo "Steps:"
+  echo "  0. Build the extension: npm install && npm run build"
   echo "  1. Open chrome://extensions (and/or brave://extensions)"
   echo "  2. Enable Developer Mode"
   echo "  3. Click 'Load unpacked' and select the extension/ directory"
@@ -46,6 +47,22 @@ if ! command -v node &> /dev/null; then
   echo "Error: node is not installed. Install Node.js first."
   exit 1
 fi
+
+# The host is TypeScript that node runs directly, which needs type stripping
+# on by default: Node 22.18 or later.
+if ! node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 18) ? 0 : 1)'; then
+  echo "Error: Node.js 22.18 or later is required (found $(node --version))."
+  exit 1
+fi
+
+# The extension is compiled from TypeScript into extension/dist, which the
+# manifest loads. Build it here too so a fresh checkout is ready to load.
+if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
+  echo "Installing build dependencies..."
+  cd "$SCRIPT_DIR" && npm install
+fi
+echo "Building the extension..."
+cd "$SCRIPT_DIR" && npm run build
 
 # Verify npm dependencies are installed
 if [ ! -d "$HOST_DIR/node_modules" ]; then
@@ -99,7 +116,7 @@ create_unix_wrapper() {
   NATIVE_HOST_PATH="$HOST_DIR/native-host-wrapper.sh"
   cat > "$NATIVE_HOST_PATH" << WRAPPER
 #!/bin/sh
-exec "$(command -v node)" "$HOST_DIR/native-host.js"
+exec "$(command -v node)" "$HOST_DIR/native-host.ts"
 WRAPPER
   chmod +x "$NATIVE_HOST_PATH"
   echo "Created native host wrapper: $NATIVE_HOST_PATH"
@@ -133,7 +150,7 @@ install_windows() {
   # resolves even when Chrome launches it with a minimal PATH.
   if [ -f "${node_posix}.exe" ]; then node_posix="${node_posix}.exe"; fi
   node_win="$(cygpath -w "$node_posix")"
-  host_js_win="$(cygpath -w "$HOST_DIR/native-host.js")"
+  host_js_win="$(cygpath -w "$HOST_DIR/native-host.ts")"
 
   # The .bat Chrome launches. CRLF endings; %* forwards Chrome's args (the
   # extension origin + parent-window handle, which the host ignores). cmd.exe
@@ -230,12 +247,12 @@ case "$OS_KIND" in
     ;;
 esac
 
-# Path to mcp-server.js shown in the copy-paste hint, in the current OS's
-# native form (cygpath yields a clean C:\...\host\mcp-server.js on Windows).
+# Path to mcp-server.ts shown in the copy-paste hint, in the current OS's
+# native form (cygpath yields a clean C:\...\host\mcp-server.ts on Windows).
 if [ "$OS_KIND" = "windows" ]; then
-  MCP_SERVER_DISPLAY="$(cygpath -w "$HOST_DIR/mcp-server.js")"
+  MCP_SERVER_DISPLAY="$(cygpath -w "$HOST_DIR/mcp-server.ts")"
 else
-  MCP_SERVER_DISPLAY="$HOST_DIR/mcp-server.js"
+  MCP_SERVER_DISPLAY="$HOST_DIR/mcp-server.ts"
 fi
 
 echo ""

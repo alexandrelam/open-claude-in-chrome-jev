@@ -28,20 +28,20 @@ bad()  { printf "  \033[31m✗\033[0m %s\n" "$1"; }
 # ---- 1. pre-flight: is the new instruction wiring actually on disk? ----
 bold "pre-flight — instruction wiring on disk"
 PASS=1
-grep -q "export const SERVER_INSTRUCTIONS" "$HOST/codemode/common.js" \
-  && ok "common.js exports SERVER_INSTRUCTIONS (L1 source)" \
-  || { bad "common.js missing SERVER_INSTRUCTIONS"; PASS=0; }
-grep -q "instructions: SERVER_INSTRUCTIONS" "$HOST/codemode/server-hybrid.js" \
-  && ok "server-hybrid.js wires instructions into the Server (L1)" \
-  || { bad "server-hybrid.js does not set instructions"; PASS=0; }
-grep -q "instructions: SERVER_INSTRUCTIONS" "$HOST/codemode/server-codemode.js" \
-  && ok "server-codemode.js wires instructions into the McpServer (L1)" \
-  || { bad "server-codemode.js does not set instructions"; PASS=0; }
-grep -q "recognize a pattern, then batch it" "$HOST/codemode/common.js" \
-  && ok "common.js carries the rewritten execute_code strategy (L4d)" \
-  || { bad "common.js missing the L4d rewrite"; PASS=0; }
+grep -q "export const SERVER_INSTRUCTIONS" "$HOST/codemode/common.ts" \
+  && ok "common.ts exports SERVER_INSTRUCTIONS (L1 source)" \
+  || { bad "common.ts missing SERVER_INSTRUCTIONS"; PASS=0; }
+grep -q "instructions: SERVER_INSTRUCTIONS" "$HOST/codemode/server-hybrid.ts" \
+  && ok "server-hybrid.ts wires instructions into the Server (L1)" \
+  || { bad "server-hybrid.ts does not set instructions"; PASS=0; }
+grep -q "instructions: SERVER_INSTRUCTIONS" "$HOST/codemode/server-codemode.ts" \
+  && ok "server-codemode.ts wires instructions into the McpServer (L1)" \
+  || { bad "server-codemode.ts does not set instructions"; PASS=0; }
+grep -q "recognize a pattern, then batch it" "$HOST/codemode/common.ts" \
+  && ok "common.ts carries the rewritten execute_code strategy (L4d)" \
+  || { bad "common.ts missing the L4d rewrite"; PASS=0; }
 # syntax sanity so a relaunch can't fail on a typo
-for f in common.js server-hybrid.js server-codemode.js; do
+for f in common.ts server-hybrid.ts server-codemode.ts; do
   node --check "$HOST/codemode/$f" 2>/dev/null \
     && ok "syntax OK: codemode/$f" \
     || { bad "SYNTAX ERROR: codemode/$f — fix before refreshing"; PASS=0; }
@@ -49,8 +49,8 @@ done
 # The jev variant lives at the host root and pulls in host/jev/*; a typo in any
 # of them only surfaces when the server is relaunched, which is exactly the
 # thing this script exists to make safe.
-for f in server-jev.js jev/config.js jev/client.js jev/observe.js jev/actions.js \
-         jev/shortlist.js jev/trace.js jev/navigator.js jev/tools.js; do
+for f in server-jev.ts jev/config.ts jev/client.ts jev/observe.ts jev/actions.ts \
+         jev/shortlist.ts jev/trace.ts jev/navigator.ts jev/tools.ts; do
   node --check "$HOST/$f" 2>/dev/null \
     && ok "syntax OK: $f" \
     || { bad "SYNTAX ERROR: $f — fix before refreshing"; PASS=0; }
@@ -60,10 +60,10 @@ done
 # ---- 2. what's running right now ----
 echo
 bold "running MCP servers (this repo)"
-HY=$(pgrep -f "$SCOPE/codemode/server-hybrid.js" | wc -l | tr -d ' ')
-CM=$(pgrep -f "$SCOPE/codemode/server-codemode.js" | wc -l | tr -d ' ')
-DF=$(pgrep -f "$SCOPE/mcp-server.js" | wc -l | tr -d ' ')
-JV=$(pgrep -f "$SCOPE/server-jev.js" | wc -l | tr -d ' ')
+HY=$(pgrep -f "$SCOPE/codemode/server-hybrid\.[jt]s" | wc -l | tr -d ' ')
+CM=$(pgrep -f "$SCOPE/codemode/server-codemode\.[jt]s" | wc -l | tr -d ' ')
+DF=$(pgrep -f "$SCOPE/mcp-server\.[jt]s" | wc -l | tr -d ' ')
+JV=$(pgrep -f "$SCOPE/server-jev\.[jt]s" | wc -l | tr -d ' ')
 printf "  hybrid: %s   codemode: %s   default: %s   jev: %s\n" "$HY" "$CM" "$DF" "$JV"
 TOTAL=$(( HY + CM + DF + JV ))
 [ "$TOTAL" -gt 1 ] && printf "  \033[33m%s\033[0m\n" "note: $TOTAL servers alive — stale instances accumulate across sessions; this clears them."
@@ -78,16 +78,16 @@ echo
 bold "K5 — killing stale MCP servers + wrangler/workerd sandboxes"
 # order: sandboxes first (children), then the servers (parents)
 pkill -9 -f "$SCOPE/codemode/worker" 2>/dev/null && ok "killed wrangler/workerd under host/codemode/worker" || ok "no wrangler/workerd to kill"
-pkill -9 -f "$SCOPE/codemode/server-hybrid.js"   2>/dev/null && ok "killed server-hybrid.js"   || ok "no server-hybrid.js running"
-pkill -9 -f "$SCOPE/codemode/server-codemode.js" 2>/dev/null && ok "killed server-codemode.js" || ok "no server-codemode.js running"
-pkill -9 -f "$SCOPE/mcp-server.js"               2>/dev/null && ok "killed mcp-server.js"       || ok "no default mcp-server.js running"
-pkill -9 -f "$SCOPE/server-jev.js"              2>/dev/null && ok "killed server-jev.js"      || ok "no server-jev.js running"
+pkill -9 -f "$SCOPE/codemode/server-hybrid\.[jt]s"   2>/dev/null && ok "killed server-hybrid.ts"   || ok "no server-hybrid.ts running"
+pkill -9 -f "$SCOPE/codemode/server-codemode\.[jt]s" 2>/dev/null && ok "killed server-codemode.ts" || ok "no server-codemode.ts running"
+pkill -9 -f "$SCOPE/mcp-server\.[jt]s"               2>/dev/null && ok "killed mcp-server.ts"       || ok "no default mcp-server.ts running"
+pkill -9 -f "$SCOPE/server-jev\.[jt]s"              2>/dev/null && ok "killed server-jev.ts"      || ok "no server-jev.ts running"
 sleep 1
 
 # ---- 4. confirm clean ----
 echo
 bold "verify"
-LEFT=$(pgrep -f "$SCOPE/codemode/server-hybrid.js|$SCOPE/codemode/server-codemode.js|$SCOPE/mcp-server.js|$SCOPE/server-jev.js" | wc -l | tr -d ' ')
+LEFT=$(pgrep -f "$SCOPE/codemode/server-hybrid\.[jt]s|$SCOPE/codemode/server-codemode\.[jt]s|$SCOPE/mcp-server\.[jt]s|$SCOPE/server-jev\.[jt]s" | wc -l | tr -d ' ')
 if [ "$LEFT" = "0" ]; then
   ok "no MCP servers from this repo are running — next connect loads fresh code"
 else

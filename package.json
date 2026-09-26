@@ -1,0 +1,28 @@
+{
+  "name": "open-claude-in-chrome",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p extension",
+    "typecheck": "tsc -p host --noEmit && tsc -p host/test --noEmit && tsc -p extension --noEmit && tsc -p test --noEmit",
+    "typecheck:worker": "tsc -p host/codemode/worker --noEmit",
+    "lint": "oxlint --type-aware",
+    "lint:fix": "oxlint --type-aware --fix",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "test": "npm test --prefix host && node --disable-warning=ExperimentalWarning test/audit-segments.test.ts && node --disable-warning=ExperimentalWarning test/handlers.test.ts && node --disable-warning=ExperimentalWarning test/humanize-executor.test.ts && node --disable-warning=ExperimentalWarning test/humanize-planners.test.ts",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.0",
+    "@types/node": "^22.20.4",
+    "devtools-protocol": "^0.0.1704951",
+    "oxfmt": "^0.70.0",
+    "oxlint": "^1.85.0",
+    "oxlint-tsgolint": "^7.0.2003",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

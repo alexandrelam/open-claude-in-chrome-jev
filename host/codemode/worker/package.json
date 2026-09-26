@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "worker.js",
+  "main": "worker.ts",
   "dependencies": {
     "@cloudflare/codemode": "^0.3.7"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
     "wrangler": "^4.94.0"
   }
 }

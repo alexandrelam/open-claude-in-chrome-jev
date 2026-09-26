@@ -1,7 +1,7 @@
 {
   "name": "open-claude-in-chrome-codemode",
-  "main": "worker.js",
+  "main": "worker.ts",
   "compatibility_date": "2025-09-01",
   "compatibility_flags": ["nodejs_compat"],
-  "worker_loaders": [{ "binding": "LOADER" }]
+  "worker_loaders": [{ "binding": "LOADER" }],
 }

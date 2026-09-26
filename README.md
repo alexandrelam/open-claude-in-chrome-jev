@@ -29,7 +29,7 @@
 
 Most browser steps are mechanical choices ("click Search", "open the first row")
 that don't need a frontier model, yet each one costs a full orchestrator turn.
-This fork adds a `jev` server variant, `host/server-jev.js`, that hands those
+This fork adds a `jev` server variant, `host/server-jev.ts`, that hands those
 choices to [Jev](https://openrouter.ai/docs/guides/community/jev), TypeSafe's
 decision model, over OpenRouter:
 
@@ -45,7 +45,7 @@ action still goes through the extension, so Jev drives **the browser you are
 actually logged into**.
 
 ```bash
-claude mcp add open-claude-in-chrome-jev --env OPENROUTER_API_KEY=sk-or-v1-... -- node /absolute/path/to/host/server-jev.js
+claude mcp add open-claude-in-chrome-jev --env OPENROUTER_API_KEY=sk-or-v1-... -- node /absolute/path/to/host/server-jev.ts
 ```
 
 Full details: [Delegating steps to Jev](#delegating-steps-to-jev).
@@ -132,16 +132,16 @@ grading is ambiguous, and repeat runs of an identical configuration vary by
 Default:
 
 ```
-Claude Code <--stdio MCP--> mcp-server.js <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
+Claude Code <--stdio MCP--> mcp-server.ts <--TCP--> native-host.ts <--native messaging--> Extension <--> Browser
 ```
 
-Code mode / hybrid (additive — `mcp-server.js` is reused unchanged as the upstream):
+Code mode / hybrid (additive — `mcp-server.ts` is reused unchanged as the upstream):
 
 ```
-Claude Code <--stdio MCP--> server-{codemode,hybrid}.js
+Claude Code <--stdio MCP--> server-{codemode,hybrid}.ts
                               |  spawns + proxies via MCP
                               v
-                            mcp-server.js (child) <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
+                            mcp-server.ts (child) <--TCP--> native-host.ts <--native messaging--> Extension <--> Browser
                               ^
                               |  HTTP tool-callback
                               |
@@ -156,7 +156,7 @@ Three components:
 2. **MCP Server** — Node.js process started by Claude Code, exposes tools via MCP
 3. **Native Messaging Host** — Bridge between the MCP server and the extension
 
-The codemode and hybrid servers add a fourth piece — a `wrangler dev` subprocess hosting a Cloudflare Worker that runs the LLM-generated code in a V8 isolate. The Worker calls back to the proxy over HTTP for actual tool execution, which is forwarded to the unchanged upstream `mcp-server.js`.
+The codemode and hybrid servers add a fourth piece — a `wrangler dev` subprocess hosting a Cloudflare Worker that runs the LLM-generated code in a V8 isolate. The Worker calls back to the proxy over HTTP for actual tool execution, which is forwarded to the unchanged upstream `mcp-server.ts`.
 
 ## Installation
 
@@ -165,17 +165,22 @@ One flow, top to bottom, turns everything on — all 21 browser tools,
 
 ### Prerequisites
 
-- **Node.js** v18+
+- **Node.js** v22.18+ (the host runs its TypeScript directly, which needs type stripping on by default)
 - **Any Chromium browser** (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.)
 - **Claude Code** v2.1.80+ (the recorder needs channels; browser automation alone works on v2.0.73+)
 - **An OpenAI API key** (used to transcribe recording narration)
 
-### Step 1: Install dependencies
+### Step 1: Install dependencies and build the extension
 
 ```bash
+npm install
+npm run build
 npm install --prefix host
 npm install --prefix host/codemode/worker
 ```
+
+The extension is written in TypeScript; `npm run build` compiles it into
+`extension/dist/`, which the manifest loads. Run it again after pulling.
 
 The second one is not optional: it provisions the sandbox that `execute_code`
 runs in. Skip it and the server falls back to fetching wrangler over the network
@@ -217,7 +222,7 @@ The **hybrid** server exposes everything: all 21 tools directly, `execute_code`
 alongside (the model picks per call), and the recording channel.
 
 ```bash
-claude mcp add open-claude-in-chrome-hybrid -- node /absolute/path/to/host/codemode/server-hybrid.js
+claude mcp add open-claude-in-chrome-hybrid -- node /absolute/path/to/host/codemode/server-hybrid.ts
 ```
 
 Find the absolute path with `echo "$(pwd)/host"`.
@@ -310,17 +315,17 @@ register more than one.
 
 **Default** — the 21 tools, nothing else:
 ```bash
-claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.js
+claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.ts
 ```
 
 **Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 21 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
 ```bash
-claude mcp add open-claude-in-chrome-codemode -- node /absolute/path/to/host/codemode/server-codemode.js
+claude mcp add open-claude-in-chrome-codemode -- node /absolute/path/to/host/codemode/server-codemode.ts
 ```
 
 **Jev** — the 21 tools plus a decision layer that takes a whole subgoal in one call. See [Delegating steps to Jev](#delegating-steps-to-jev):
 ```bash
-claude mcp add open-claude-in-chrome-jev --env OPENROUTER_API_KEY=sk-or-v1-... -- node /absolute/path/to/host/server-jev.js
+claude mcp add open-claude-in-chrome-jev --env OPENROUTER_API_KEY=sk-or-v1-... -- node /absolute/path/to/host/server-jev.ts
 ```
 
 The first three carry the same sandbox as hybrid, so [Keeping `execute_code` running](#keeping-execute_code-running) applies to them too. Recording is only on the hybrid server; the jev server has no sandbox and no `execute_code`.
@@ -436,7 +441,7 @@ What to look for across the three MCP variants:
 - Challenge 3: this is where the gap should open. One screenshot up front, then three batched form-fills in code-mode/hybrid vs. fresh look-act loops in default.
 - Challenge 4: similar. Coordinates fixed, sequence visible. Code mode batches the nine clicks; default clicks one at a time.
 
-If the model still uses direct tools on the second submission, that's a signal the `execute_code` description needs tuning — see `host/codemode/common.js` (`buildExecuteCodeDescription`) and the per-server `EXTRA_NOTES`.
+If the model still uses direct tools on the second submission, that's a signal the `execute_code` description needs tuning — see `host/codemode/common.ts` (`buildExecuteCodeDescription`) and the per-server `EXTRA_NOTES`.
 
 #### Results
 
@@ -662,7 +667,7 @@ The jev server is a plain stdio MCP server, so it registers like any other. In
   "mcpServers": {
     "open-claude-in-chrome-jev": {
       "command": "node",
-      "args": ["/absolute/path/to/host/server-jev.js"],
+      "args": ["/absolute/path/to/host/server-jev.ts"],
       "env": { "OPENROUTER_API_KEY": "sk-or-v1-..." }
     }
   }
@@ -856,17 +861,34 @@ which is why the recorder's own image track is not replaced by it.
 - `select_browser` — pick which browser drives automation.
 - `upload_image` drop-at-coordinate — Open Claude in Chrome's `upload_image` attaches to a file input by `ref` only.
 
+## Development
+
+Everything outside `extension/vendor/` is strict TypeScript (`tsconfig.base.json`).
+From the repository root, after `npm install`:
+
+| Command | What it does |
+|---|---|
+| `npm run build` | Compile the extension into `extension/dist/` |
+| `npm run typecheck` | Type-check the host, the extension and both test suites |
+| `npm run typecheck:worker` | Type-check the codemode Worker (needs `npm install --prefix host/codemode/worker`) |
+| `npm run lint` / `npm run lint:fix` | [oxlint](https://oxc.rs/docs/guide/usage/linter), with type-aware rules |
+| `npm run format` / `npm run format:check` | [oxfmt](https://oxc.rs/docs/guide/usage/formatter) |
+| `npm test` | The host tests and the extension tests |
+| `npm run check` | All of the above except the build, as CI would run them |
+
 ## Updating After Code Changes
 
-No build step. All files are plain JavaScript. After pulling or editing code:
+The host is TypeScript that Node runs directly, so it has no build step. The
+extension is compiled: run `npm run build` after changing anything under
+`extension/`. After pulling or editing code:
 
 | What changed | What to do |
 |---|---|
-| `extension/background.js`, `extension/content.js`, `extension/manifest.json`, or `extension/recorder/*` | Reload the extension: `brave://extensions` > click the reload icon |
-| `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
-| `host/codemode/*.js` or `host/codemode/worker/*` | Kill the codemode server: `pkill -f "server-codemode\|server-hybrid"` and `pkill -f wrangler`, then `/mcp` in Claude Code |
-| `host/server-jev.js` or `host/jev/*` | `./refresh-mcp.sh` (syntax-checks every jev file, then kills stale servers), then `/mcp` in Claude Code |
-| `host/native-host.js` | Restart the browser (close all windows, reopen) |
+| `extension/*.ts`, `extension/manifest.json`, or `extension/recorder/*` | `npm run build`, then reload the extension: `brave://extensions` > click the reload icon |
+| `host/mcp-server.ts` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
+| `host/codemode/*.ts` or `host/codemode/worker/*` | Kill the codemode server: `pkill -f "server-codemode\|server-hybrid"` and `pkill -f wrangler`, then `/mcp` in Claude Code |
+| `host/server-jev.ts` or `host/jev/*` | `./refresh-mcp.sh` (syntax-checks every jev file, then kills stale servers), then `/mcp` in Claude Code |
+| `host/native-host.ts` | Restart the browser (close all windows, reopen) |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
 ### Quick reset (nuclear option)
@@ -920,7 +942,7 @@ before filing an issue, and where feature discussion happens.
 
 Use an absolute path:
 ```bash
-claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.js
+claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.ts
 ```
 
 ### "Browser extension is not connected"

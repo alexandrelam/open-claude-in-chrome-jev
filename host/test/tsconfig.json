@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // Tests index into fixtures they just built, and a wrong guess fails the
+    // test anyway. Everything else stays as strict as the source.
+    "noUncheckedIndexedAccess": false
+  },
+  "include": ["**/*.ts"]
+}
