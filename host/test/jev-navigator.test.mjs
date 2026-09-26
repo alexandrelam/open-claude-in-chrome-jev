@@ -1158,6 +1158,158 @@ await check("a carried 'next leg already satisfied' the URL contradicts is not t
   eq(out.subgoals[1].steps.length, 1, "the second leg clicked rather than finishing on arrival");
 });
 
+// --- hand-backs Claude can act on, defaults, questions, history -------------
+
+// The audited admin form: Save stays disabled until Visit type and Format are
+// chosen, and the plan Claude wrote did not know that.
+const templateForm = () => [
+  row({ ref: "ref_1", role: "button", name: "New template" }),
+  row({ ref: "ref_2", role: "textbox", name: "Name", type: "text", value: "Cache fix test template" }),
+  row({ ref: "ref_3", role: "combobox", name: "Visit type", required: true }),
+  row({ ref: "ref_4", role: "combobox", name: "Format", value: "Select a format" }),
+  row({ ref: "ref_5", role: "button", name: "Save", disabled: true })
+];
+
+await check("a disabled Save is shown to Jev but never offered as a target", async () => {
+  const browser = fakeBrowser({ rows: templateForm() });
+  const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "Click Save", success_criteria: "the template is saved" });
+  const { state, questions } = client.seen[0];
+  assert(state.elements.some((e) => e.includes("Save") && e.includes("disabled")), `Save missing from state: ${state.elements}`);
+  assert(!Object.values(questions.click_target.criteria).some((c) => c.includes("Save")), "Save was offered as a click target");
+});
+
+await check("a stuck leg names the disabled control and the empty fields, and echoes the remaining legs", async () => {
+  const browser = fakeBrowser({ rows: templateForm() });
+  const client = fakeClient([
+    { operation: choice("DONE", 0.9), sensitive: noul(0), satisfied: noul(0.95) },
+    { operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }
+  ]);
+  const later = { goal: "Open Settings", success_criteria: "settings page is open" };
+  const out = await navigate(browser.callTool, client, CFG, {
+    tabId: 1,
+    subgoals: [
+      { goal: "Open a new template", success_criteria: "the form is open" },
+      { goal: "Click the Save button", success_criteria: "the template is saved" },
+      later
+    ]
+  });
+  eq(out.status, "blocked", `reason: ${out.reason}`);
+  eq(out.blockers?.disabled?.[0]?.name, "Save", "the disabled control");
+  const empty = (out.blockers?.empty ?? []).map((r) => r.name);
+  assert(empty.includes("Visit type") && empty.includes("Format"), `empty fields: ${empty}`);
+  assert(!empty.includes("Name"), "a filled field is not reported empty");
+  eq(empty[0], "Visit type", "required fields first");
+  assert(out.reason.includes('"Save" is disabled') && out.reason.includes("Visit type"), `reason: ${out.reason}`);
+  eq(JSON.stringify(out.remaining_subgoals), JSON.stringify([later]), "the untouched legs, verbatim");
+  const rows = out.page_excerpt.interactive;
+  assert(rows.some((l) => l.startsWith("ref_5 |") && l.includes("disabled")), `rows by ref, disabled marked: ${rows}`);
+});
+
+await check("no blockers when nothing the goal names is disabled", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
+  const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  const out = await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "open the report", success_criteria: "report shown" });
+  eq(out.blockers, undefined, "nothing to report");
+  eq(out.remaining_subgoals, undefined, "single goal, nothing remaining");
+});
+
+const formatSelect = () => row({
+  ref: "ref_1", role: "combobox", name: "Format",
+  options: [{ value: "", label: "Select…", selected: true }, { value: "soap", label: "SOAP", selected: false }]
+});
+
+await check("fill_defaults picks the first real option for a select given no value", async () => {
+  const browser = fakeBrowser({ rows: [formatSelect()] });
+  const client = fakeClient([
+    { operation: choice("SELECT", 0.95), select_target: choice("e1", 0.95), sensitive: noul(0), satisfied: notYet },
+    { operation: choice("DONE", 0.9), sensitive: noul(0), satisfied: noul(0.95) }
+  ]);
+  const out = await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "choose a format", success_criteria: "a format is chosen", fill_defaults: true });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  const act = browser.calls.find((c) => c.name === "jev_act");
+  eq(act?.args.value, "soap", "the first real option, not the placeholder");
+  eq(out.steps[0].defaulted_value, "soap", "the step says the value was a default");
+  assert(client.seen[0].state.defaults, "Jev is told any option will do");
+});
+
+await check("without fill_defaults the same select still needs a value", async () => {
+  const browser = fakeBrowser({ rows: [formatSelect()] });
+  const client = fakeClient([{ operation: choice("SELECT", 0.95), select_target: choice("e1", 0.95), sensitive: noul(0), satisfied: notYet }]);
+  const out = await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "choose a format", success_criteria: "a format is chosen" });
+  eq(out.status, "needs_value", "status");
+});
+
+await check("fill_defaults never makes up text", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "textbox", name: "Name", type: "text" })] });
+  const client = fakeClient([{ operation: choice("TYPE_TEXT", 0.95), text_target: choice("e1", 0.95), sensitive: noul(0), satisfied: notYet }]);
+  const out = await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "name it", success_criteria: "named", fill_defaults: true });
+  eq(out.status, "needs_value", "status");
+  assert(!browser.calls.some((c) => c.name === "jev_act"), "nothing was typed");
+});
+
+await check("questions are answered with final_check in one extra request", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "switch", name: "Enable this template", checked: false })] });
+  const client = fakeClient([
+    { operation: choice("DONE", 0.9), sensitive: noul(0), satisfied: noul(0.95) },
+    { verified: noul(0.9), disabled: noul(0.93) }
+  ]);
+  const out = await navigate(browser.callTool, client, CFG, {
+    tabId: 1, goal: "open the template", success_criteria: "its page is open",
+    final_check: "the template page is open",
+    questions: [{ key: "disabled", type: "yes_no", question: "Is 'Enable this template' switched off?" }]
+  });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(client.seen.length, 2, "one step, one closing request");
+  const closing = client.seen[1].questions;
+  assert(closing.verified && closing.disabled, `both asked together: ${Object.keys(closing)}`);
+  eq(out.answers?.disabled?.yes, 0.93, "the compacted answer");
+  assert(client.seen[1].state.elements.some((e) => e.includes("checked=false")), "the switch state is in front of Jev");
+});
+
+await check("questions are not asked when a leg stopped the run", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
+  const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  const out = await navigate(browser.callTool, client, CFG, {
+    tabId: 1, goal: "g", success_criteria: "s",
+    questions: [{ key: "ok", type: "yes_no", question: "Is it ok?" }]
+  });
+  eq(out.status, "blocked", "status");
+  eq(client.seen.length, 1, "no closing request");
+  eq(out.answers, undefined, "no answers about the wrong page");
+});
+
+await check("malformed questions are refused before the browser is touched", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
+  const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  for (const questions of [
+    [{ key: "verified", type: "yes_no", question: "clashes with final_check" }],
+    [{ key: "pick", type: "choice", question: "one option only", options: { a: "A" } }]
+  ]) {
+    const out = await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "g", success_criteria: "s", start_url: "https://app.test/x", questions });
+    eq(out.status, "error", `refused: ${JSON.stringify(questions)}`);
+  }
+  eq(browser.calls.length, 0, "no navigate, no snapshot");
+  eq(client.seen.length, 0, "no Jev request");
+});
+
+await check("Jev sees what it already did in this leg", async () => {
+  const browser = fakeBrowser({
+    rows: [row({ ref: "ref_1", role: "button", name: "New template" })],
+    onClick: (s) => { s.url = "https://app.test/a?new=true"; s.rows = [row({ ref: "ref_1", role: "button", name: "New template" }), row({ ref: "ref_2", role: "textbox", name: "Name", type: "text" })]; }
+  });
+  const client = fakeClient([
+    { operation: choice("CLICK", 0.95), click_target: choice("e1", 0.95), sensitive: noul(0), satisfied: notYet },
+    { operation: choice("DONE", 0.9), sensitive: noul(0), satisfied: noul(0.95) }
+  ]);
+  await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "open a new template", success_criteria: "the form is open" });
+  eq(client.seen[0].state.history, undefined, "nothing on the first decision");
+  const h = client.seen[1].state.history;
+  eq(h?.[0]?.operation, "CLICK", "the click is remembered");
+  assert(h[0].target.includes("New template"), `target: ${h[0].target}`);
+  eq(h[0].page_changed, true, "and that it changed the page");
+});
+
 try {
   fs.rmSync(CFG.tracesDir, { recursive: true, force: true });
 } catch {}

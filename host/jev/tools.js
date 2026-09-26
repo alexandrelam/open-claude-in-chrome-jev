@@ -5,11 +5,26 @@
 
 import { z } from "zod";
 
+// One question Claude asks Jev, shared by jev_assess (per item) and
+// jev_navigate (about the page the run ends on).
+const QUESTION = z.object({
+  key: z.string().describe("Short identifier used in the results, e.g. good_deal."),
+  type: z.enum(["yes_no", "choice", "score"]),
+  question: z.string().describe("The question, stated fully — Jev sees nothing else of your intent."),
+  yes: z.string().optional().describe("yes_no: what counts as yes. Default 'Yes'."),
+  no: z.string().optional().describe("yes_no: what counts as no. Default 'No'."),
+  options: z.record(z.string()).optional().describe("choice: {key: description}, at least two."),
+  scale: z.array(z.string()).optional().describe("score: ordered labels, low to high, e.g. ['Poor','Fair','Good','Great'].")
+});
+
+const FILL_DEFAULTS =
+  "Where a choice field (select, combobox, radio, checkbox) has no value in `values`, any valid option is acceptable and Jev picks the first real one. Never applies to free-text fields, which still return needs_value. Use it for forms whose choices you don't care about, e.g. test data.";
+
 export const JEV_TOOLS = [
   {
     name: "jev_navigate",
     description:
-      "Delegate a bounded browser subgoal to the Jev decision model, which picks each next action while the extension carries it out in the real profile. Use this instead of a run of read_page/computer calls when the steps are mechanical (click through to a page, filter a list, fill a form whose values you supply). You keep planning: give one subgoal, an observable success condition, and any text to type. Returns the status, the steps taken, and an excerpt of the final page so you can continue without calling read_page. A status of needs_help, needs_value or blocked means it stopped deliberately and is handing control back to you — read `reason`, take that one step yourself with the ordinary tools, then call again with only the subgoals that remain rather than re-planning. A status of partial means every leg ran but some were skipped; `reason` lists them.",
+      "Delegate browser work to the Jev decision model, which picks each next action while the extension carries it out in the real profile. Put the WHOLE task in one call: the navigation and form legs as `subgoals`, the text to type as `values`, `fill_defaults` for choice fields you don't care about, and the check you would otherwise do by reading the page as `questions`.\n\nWhen it hands back (needs_help, needs_value, blocked), stay in Jev. `reason` and `blockers` say what is in the way (e.g. Save is disabled, and these fields are empty). Call again with fix-up legs followed by `remaining_subgoals`, which is returned for exactly that. If one step truly needs the ordinary tools, act by `ref` from `page_excerpt.interactive`, not by screenshot coordinates, and go back to jev_navigate for the rest.\n\nReturns the status, the steps taken, `answers` to your questions, and the final page's controls by ref. A status of partial means every leg ran but some optional ones were skipped; `reason` lists them.",
     paramShape: {
       goal: z
         .string()
@@ -23,6 +38,7 @@ export const JEV_TOOLS = [
             goal: z.string().describe("This leg's objective."),
             success_criteria: z.string().describe("Observable condition that means this leg is finished."),
             values: z.record(z.string()).optional().describe("Text for this leg's fields, as {label: value}."),
+            fill_defaults: z.boolean().optional().describe(`This leg only. ${FILL_DEFAULTS}`),
             optional: z
               .boolean()
               .optional()
@@ -46,13 +62,20 @@ export const JEV_TOOLS = [
         .string()
         .optional()
         .describe(
-          'Observable condition for `goal`, e.g. "an invoice detail page with a total is shown". Checked on every step. Prefer criteria about WHERE you are over criteria about page content — "the revision history view is open" reads far more reliably than "a list of revisions with dates is shown", because the check sees the page\'s controls plus a short text excerpt rather than the full body. Required with `goal`; use the per-leg field inside `subgoals` instead.'
+          'Observable condition for `goal`, e.g. "an invoice detail page with a total is shown". Checked on every step. Prefer criteria about WHERE you are over criteria about page content — "the revision history view is open" reads far more reliably than "a list of revisions with dates is shown", because the check sees the page\'s controls plus a short text excerpt rather than the full body. When the app puts state in the URL, say so as key=value ("newEncounterProfile=true in the URL"): that part is checked exactly. Required with `goal`; use the per-leg field inside `subgoals` instead.'
         ),
       values: z
         .record(z.string())
         .optional()
         .describe(
           'Text you supply for any field that has to be filled, as {label: value}. Jev picks which value belongs in which field but never invents one — if a field needs a value you did not provide, the call returns needs_value.'
+        ),
+      fill_defaults: z.boolean().optional().describe(`Every leg, unless a leg sets its own. ${FILL_DEFAULTS}`),
+      questions: z
+        .array(QUESTION)
+        .optional()
+        .describe(
+          "Your questions about the page the run ends on, answered by Jev once every leg has finished (in the same request as final_check), and returned under `answers` as probabilities. Use them for verification — \"is the Enable switch off?\", \"does the list show the new item?\" — instead of taking a screenshot or reading the page yourself. Not asked when a leg stopped the run."
         ),
       start_url: z
         .string()
@@ -83,7 +106,7 @@ export const JEV_TOOLS = [
   {
     name: "jev_assess",
     description:
-      "Ask Jev YOUR questions about many items in one call, and read every answer at the end in one table. Use it whenever you would otherwise open or read items one by one to judge them: listings, profiles, search results, rows of data. Each item is a page to open (`url`), text you already have (`text`), or a page reached by first running a navigation `goal` (the same loop as jev_navigate). Questions are yes_no, choice or score, and Jev answers each with a probability — it never writes text. Put the facts a page cannot know, and your rules for judging, in `context` (e.g. today's new price and what counts as a good deal): Jev applies them to every item. Returns a per-question summary plus one row per item with the answers and a short excerpt, so you can check the doubtful ones yourself.",
+      "Ask Jev YOUR questions about many items in one call, and read every answer at the end in one table. Use it whenever you would otherwise open or read items one by one to judge them: listings, profiles, search results, rows of data. Each item is a page to open (`url`), text you already have (`text`), or a page reached by first running a navigation `goal` (the same loop as jev_navigate). Questions are yes_no, choice or score, and Jev answers each with a probability — it never writes text. Put the facts a page cannot know, and your rules for judging, in `context` (e.g. today's new price and what counts as a good deal): Jev applies them to every item. Items can also come from `items_script`, a script run on the page that returns them, so a list you would otherwise extract first is built and judged in the same call. Returns a per-question summary plus one row per item with the answers and a short excerpt, so you can check the doubtful ones yourself.",
     paramShape: {
       items: z
         .array(
@@ -98,19 +121,15 @@ export const JEV_TOOLS = [
             selector: z.string().optional().describe("CSS selector of the part of the page to read, overriding the call's `selector`.")
           })
         )
-        .describe(`Up to ${50} items. Text items run in parallel; items that open pages share the tab and run in order.`),
+        .optional()
+        .describe(`Up to ${50} items, counting any from items_script. Text items run in parallel; items that open pages share the tab and run in order.`),
+      items_script: z
+        .string()
+        .optional()
+        .describe("JavaScript run in `tabId` (top-level await allowed) whose last expression is an array of items shaped like `items` (e.g. [{url, label, context}] built from the page's data). They are appended to `items`, so extracting the list and judging it takes one call instead of two."),
+      items_script_timeout_ms: z.number().optional().describe("How long items_script may run, in ms (default 20000, max 120000)."),
       questions: z
-        .array(
-          z.object({
-            key: z.string().describe("Short identifier used in the results, e.g. good_deal."),
-            type: z.enum(["yes_no", "choice", "score"]),
-            question: z.string().describe("The question, stated fully — Jev sees nothing else of your intent."),
-            yes: z.string().optional().describe("yes_no: what counts as yes. Default 'Yes'."),
-            no: z.string().optional().describe("yes_no: what counts as no. Default 'No'."),
-            options: z.record(z.string()).optional().describe("choice: {key: description}, at least two."),
-            scale: z.array(z.string()).optional().describe("score: ordered labels, low to high, e.g. ['Poor','Fair','Good','Great'].")
-          })
-        )
+        .array(QUESTION)
         .describe("Asked of every item, all in one Jev request per item."),
       context: z
         .string()

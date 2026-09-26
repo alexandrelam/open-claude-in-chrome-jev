@@ -49,6 +49,22 @@ await check("the dangerous tools are absent from the action space entirely", asy
   assert(emitted.has("computer") && emitted.has("form_input"), "the permitted tools should still be reachable");
 });
 
+await check("a disabled row is never a target, for any operation", async () => {
+  // Disabled rows are now offered to Jev as context (a disabled Save explains
+  // a stuck form), so the gate is what keeps them from being acted on.
+  for (const op of ["CLICK", "SELECT", "TYPE_TEXT", "TYPE_AND_SUBMIT", "PRESS_ENTER"]) {
+    const r = row({ role: op === "CLICK" ? "button" : "combobox", type: op === "CLICK" ? "" : "text", options: [{ value: "a", label: "A" }], disabled: true });
+    assert(!isCompatible(op, r), `${op} accepted a disabled row`);
+  }
+  eq(availableOperations([row({ role: "button", name: "Save", disabled: true })]).includes("CLICK"), false, "a page of only disabled buttons offers no CLICK");
+});
+
+await check("renderRow marks disabled and required rows", async () => {
+  const line = renderRow(row({ role: "button", name: "Save", disabled: true }), "e1");
+  assert(line.includes("disabled"), line);
+  assert(renderRow(row({ role: "combobox", name: "Format", required: true }), "e2").includes("required"), "required");
+});
+
 await check("CLICK accepts clickable roles and hrefs, rejects text fields", async () => {
   assert(isCompatible("CLICK", row({ role: "button" })), "button");
   assert(isCompatible("CLICK", row({ role: "link" })), "link");

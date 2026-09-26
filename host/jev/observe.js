@@ -5,7 +5,7 @@
 //
 //   <indent><role> "<name, <=100 chars>" [ref_N] [href=".."] [src=".."]
 //           [value=".."] [type=".."] [expanded=..] [checked=..] [selected=..]
-//           [disabled] [options=[*v="text",  v2="text2"]]
+//           [disabled] [required] [section=".."] [options=[*v="text",  v2="text2"]]
 //
 // Three properties of that renderer make the naive split-on-spaces parser wrong:
 //
@@ -47,7 +47,7 @@ function parseOptions(raw) {
 }
 
 function parseAttrs(tail) {
-  const attrs = { disabled: false, options: null };
+  const attrs = { disabled: false, required: false, options: null };
 
   // options=[...] is appended last, so everything from its marker to the end of
   // the line belongs to it — and its contents hold both commas and quotes, so
@@ -61,6 +61,7 @@ function parseAttrs(tail) {
   }
 
   if (/(^|\s)disabled(\s|$)/.test(rest)) attrs.disabled = true;
+  if (/(^|\s)required(\s|$)/.test(rest)) attrs.required = true;
 
   const quoted = /(\w+)="((?:[^"\\]|\\.)*)"/g;
   let m;
@@ -114,6 +115,7 @@ export function parseLine(line) {
     checked: attrs.checked,
     selected: attrs.selected,
     disabled: attrs.disabled,
+    required: attrs.required,
     options: attrs.options
   };
 }
@@ -141,22 +143,27 @@ export function parsePage(text) {
 /**
  * Narrow the parsed rows to the ones worth offering Jev.
  *
- * Disabled controls are dropped because choosing one wastes a whole step on a
- * no-op the loop would then read as "page didn't change". Duplicates are
- * dropped because identical criteria descriptions would split probability mass
- * between indistinguishable options and depress confidence below the gate.
+ * Disabled controls are kept. They used to be dropped, which hid the one fact
+ * that explains a stuck form: asked to click Save while Save was disabled, Jev
+ * could not see Save at all, chose "New template" at 0.52 and handed back a
+ * reason that said nothing about the two empty required fields. Now Jev sees
+ * `button | Save | disabled` in the state, and isCompatible() refuses every
+ * disabled row as a target, so none can cost a wasted step.
+ *
+ * Duplicates are dropped because identical criteria descriptions would split
+ * probability mass between indistinguishable options and depress confidence
+ * below the gate.
  */
 export function usableRows(rows) {
   const seen = new Set();
   const out = [];
   for (const r of rows) {
-    if (r.disabled) continue;
     if (!r.role && !r.name && !r.href) continue;
     // The section is part of the identity, not decoration. Without it a form of
     // repeated cards collapses: seventeen `button "Paragraph"` rows, one per
     // card, share every other field and sixteen of them were being discarded
     // here as duplicates.
-    const key = `${r.section}|${r.role}|${r.name}|${r.href}|${r.type}|${r.value}`;
+    const key = `${r.section}|${r.role}|${r.name}|${r.href}|${r.type}|${r.value}|${r.disabled ? "d" : ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(r);
@@ -270,6 +277,7 @@ function snapshotRow(r) {
     checked: flag(r.checked),
     selected: flag(r.selected),
     disabled: Boolean(r.disabled),
+    required: Boolean(r.required),
     options: Array.isArray(r.options) ? r.options : null,
     inView: r.inView
   };
@@ -404,6 +412,8 @@ export function observationSignature(obs) {
     obs.url,
     obs.title,
     obs.rows.length,
-    obs.rows.map((r) => `${r.role}:${r.name}:${r.value}`).join("|")
+    // The disabled flag counts: filling the last required field enables Save
+    // and changes nothing else, and that is progress.
+    obs.rows.map((r) => `${r.role}:${r.name}:${r.value}${r.disabled ? ":d" : ""}`).join("|")
   ].join("~");
 }

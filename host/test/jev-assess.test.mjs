@@ -9,7 +9,8 @@
 //
 // Run: node host/test/jev-assess.test.mjs
 
-import { assess, buildQuestions, questionsError, compactAnswer, summarize } from "../jev/assess.js";
+import { assess, buildQuestions, questionsError, compactAnswer, summarize, collapseRepeats } from "../jev/assess.js";
+import { requestTimeoutMs } from "../tool-runtime.js";
 import { resolveConfig } from "../jev/config.js";
 import { BudgetExceeded } from "../jev/client.js";
 
@@ -202,6 +203,67 @@ await check("the summary counts answers per question", async () => {
 await check("an item with nothing to assess is refused up front", async () => {
   const out = await assess(fakeBrowser({}).callTool, fakeClient(answerByText), CFG, { items: [{ label: "empty" }], questions: QUESTIONS });
   eq(out.status, "error", "status");
+});
+
+await check("a title repeated back to back is read once", async () => {
+  eq(collapseRepeats("IPhone 16 écran fissuré IPhone 16 écran fissuré IPhone 16 écran fissuré 400 €"), "IPhone 16 écran fissuré 400 €", "three copies");
+  eq(collapseRepeats("Annonces (2) Iphone 16 Iphone 16 500 € Iphone 16 Iphone 16 480 €"), "Annonces (2) Iphone 16 500 € Iphone 16 480 €", "two ads stay two");
+  eq(collapseRepeats("très très bon état"), "très très bon état", "short words are left alone");
+  eq(collapseRepeats("fooPhone 1 Phone 1"), "fooPhone 1 Phone 1", "a repeat must start on a word");
+});
+
+await check("page text is de-duplicated before Jev sees it", async () => {
+  const browser = fakeBrowser({ "https://x.test/p": "Iphone 16 Iphone 16 Iphone 16 500 €" });
+  const client = fakeClient(answerByText);
+  await assess(browser.callTool, client, CFG, { tabId: 1, items: [{ url: "https://x.test/p" }], questions: QUESTIONS });
+  eq(client.seen[0].state.item.text, "Iphone 16 500 €", "Jev reads one copy");
+});
+
+await check("items_script items are appended and judged in the same call", async () => {
+  const pages = { "https://x.test/a": "S25 400 € facture", "https://x.test/b": "S25 550 €" };
+  const browser = fakeBrowser(pages);
+  const inner = browser.callTool;
+  let script = null;
+  const callTool = async (name, args) => {
+    if (name === "javascript_tool" && args.text === "BUILD") {
+      script = args;
+      return text(JSON.stringify([{ url: "https://x.test/a", label: "a" }, { url: "https://x.test/b", label: "b" }]));
+    }
+    return inner(name, args);
+  };
+  const out = await assess(callTool, fakeClient(answerByText), CFG, {
+    tabId: 1, items: [{ text: "S25 400 € facture", label: "given" }], items_script: "BUILD", items_script_timeout_ms: 60000, questions: QUESTIONS
+  });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(out.items.map((r) => r.label).join(","), "given,a,b", "given items first, then the script's");
+  eq(out.items[1].answers.invoice.yes, 0.95, "script item judged");
+  eq(script.timeout_ms, 60000, "timeout passed through");
+});
+
+await check("a script returning JSON.stringify output is accepted", async () => {
+  const callTool = async (name, args) =>
+    args.text === "BUILD" ? text(JSON.stringify(JSON.stringify([{ text: "400 facture" }]))) : text("ok");
+  const out = await assess(callTool, fakeClient(answerByText), CFG, { tabId: 1, items_script: "BUILD", questions: QUESTIONS });
+  eq(out.status, "done", `reason: ${out.reason}`);
+});
+
+await check("a failing or malformed items_script stops before any judging", async () => {
+  for (const [reply, why] of [["Error: ReferenceError: x is not defined", "failed"], ['{"a":1}', "must end in an array"], ["[1]", "not an object"]]) {
+    const client = fakeClient(answerByText);
+    const out = await assess(async () => text(reply), client, CFG, { tabId: 1, items_script: "BUILD", questions: QUESTIONS });
+    eq(out.status, "error", `status for ${reply}`);
+    assert(out.reason.includes(why), `reason for ${reply}: ${out.reason}`);
+    eq(client.seen.length, 0, "Jev not asked");
+  }
+  const out = await assess(async () => text("[]"), fakeClient(answerByText), CFG, { items_script: "BUILD", questions: QUESTIONS });
+  assert(/tabId/.test(out.reason), "needs a tab");
+});
+
+await check("the host waits longer only for a javascript_tool that asks for it", async () => {
+  eq(requestTimeoutMs("javascript_tool", {}), 60000, "default");
+  eq(requestTimeoutMs("javascript_tool", { timeout_ms: 90000 }), 100000, "extended with slack");
+  eq(requestTimeoutMs("javascript_tool", { timeout_ms: 999999 }), 130000, "capped");
+  eq(requestTimeoutMs("navigate", { timeout_ms: 90000 }), 60000, "other tools untouched");
 });
 
 const failed = results.filter((r) => !r.ok);

@@ -14,76 +14,13 @@
 import { navigate, domainAllowed, hostOf } from "./navigator.js";
 import { isToolError, resultText } from "./observe.js";
 import { BudgetExceeded } from "./client.js";
+import { buildQuestions, questionsError, compactAnswer } from "./questions.js";
+
+// Re-exported: callers and tests reached these through this module first.
+export { buildQuestions, questionsError, compactAnswer };
 
 export const MAX_ITEMS = 50;
 const TEXT_CONCURRENCY = 4;
-const RESERVED_KEYS = new Set(["model", "usage", "id"]);
-
-/** Claude's question spec, as the Decisions API wants it. */
-export function buildQuestions(questions) {
-  const out = {};
-  for (const q of questions) {
-    const instructions = q.question;
-    if (q.type === "yes_no") {
-      out[q.key] = {
-        type: "noul",
-        instructions,
-        criteria: { true: q.yes || "Yes", false: q.no || "No" }
-      };
-    } else if (q.type === "choice") {
-      out[q.key] = { type: "choice", instructions, criteria: q.options };
-    } else if (q.type === "score") {
-      out[q.key] = { type: "score", instructions, criteria: q.scale };
-    }
-  }
-  return out;
-}
-
-/** Why the question list cannot be sent, or null. Checked before any browsing. */
-export function questionsError(questions) {
-  if (!Array.isArray(questions) || questions.length === 0) return "At least one question is required.";
-  const keys = new Set();
-  for (const q of questions) {
-    if (!q.key || !/^[A-Za-z_][\w-]{0,40}$/.test(q.key)) return `Question key "${q.key}" must be a short identifier.`;
-    if (keys.has(q.key)) return `Question key "${q.key}" is used twice.`;
-    // The client reads a bare response's own fields under these names.
-    if (RESERVED_KEYS.has(q.key)) return `Question key "${q.key}" is reserved; use another name.`;
-    keys.add(q.key);
-    if (!q.question) return `Question "${q.key}" has no text.`;
-    if (q.type === "choice" && (!q.options || Object.keys(q.options).length < 2)) {
-      return `Choice question "${q.key}" needs at least two options.`;
-    }
-    if (q.type === "score" && (!Array.isArray(q.scale) || q.scale.length < 2)) {
-      return `Score question "${q.key}" needs a scale of at least two labels.`;
-    }
-    if (!["yes_no", "choice", "score"].includes(q.type)) return `Question "${q.key}" has unknown type ${q.type}.`;
-  }
-  return null;
-}
-
-/**
- * One answer, compacted for Claude to read in a table.
- *
- * The full distributions stay out: across 30 items they are most of the
- * payload and almost all zeros. What is kept is what a decision needs — the
- * answer, how sure, and the runner-up when it was close.
- */
-export function compactAnswer(a) {
-  if (!a) return null;
-  const r3 = (x) => Number(Number(x).toFixed(3));
-  if (a.type === "noul") return { yes: r3(a.noul) };
-  if (a.type === "choice") {
-    const ranked = Object.entries(a.probabilities || {}).sort((x, y) => y[1] - x[1]);
-    const out = { choice: a.choice, p: r3(a.probabilities?.[a.choice] ?? a.confidence ?? 0) };
-    if (ranked[1] && ranked[1][1] >= 0.15) out.runner_up = { choice: ranked[1][0], p: r3(ranked[1][1]) };
-    return out;
-  }
-  if (a.type === "score") {
-    const label = a.legend?.[Math.round(a.score)];
-    return { score: r3(a.score), ...(label ? { label } : {}), confidence: r3(a.confidence ?? 0) };
-  }
-  return null;
-}
 
 /** Totals per question across items, so the table can be read top-down. */
 export function summarize(rows, questions) {
@@ -105,6 +42,16 @@ export function summarize(rows, questions) {
 }
 
 /**
+ * Collapse a phrase repeated back to back into one copy. Listing cards often
+ * carry their title two or three times (link text, heading, visually hidden
+ * label), so innerText of a leboncoin profile reads "IPhone 16 IPhone 16
+ * IPhone 16 500 €" for one ad, and Jev took one ad for three of the same phone.
+ */
+export function collapseRepeats(text) {
+  return text.replace(/(?<=^| )(\S.{4,150}?)(?: \1)+(?= |$)/g, "$1");
+}
+
+/**
  * The page's readable text, from the element Claude named (or <main>, or the
  * body). Read through javascript_tool so a client-rendered page (a leboncoin
  * profile renders its rating after load) is read as the user sees it; the
@@ -114,7 +61,7 @@ async function readPage(callTool, tabId, selector, maxChars) {
   const sel = JSON.stringify(selector || "");
   const expr = `(() => {
     const el = (${sel} && document.querySelector(${sel})) || document.querySelector('main') || document.body;
-    return { url: location.href, title: document.title, text: (el ? el.innerText : '').replace(/\\s+/g, ' ').trim().slice(0, ${Number(maxChars)}) };
+    return { url: location.href, title: document.title, text: (el ? el.innerText : '').replace(/\\s+/g, ' ').trim().slice(0, ${Number(maxChars) * 3}) };
   })()`;
   // A page that renders after load answers with an empty element at first;
   // three short retries cover it without a fixed sleep on every page.
@@ -127,6 +74,9 @@ async function readPage(callTool, tabId, selector, maxChars) {
     } catch {
       return { error: `Could not read the page: ${resultText(res).slice(0, 200)}` };
     }
+    // Read three times the budget so text freed by collapsing repeats is
+    // filled with more of the page, then cut to the budget.
+    if (page.text) page.text = collapseRepeats(page.text).slice(0, maxChars);
     if (page.text || attempt === 2) return page;
     await callTool("jev_settle", { tabId, expect: "wait", timeoutMs: 500 });
   }
@@ -147,10 +97,35 @@ async function pool(items, n, fn) {
   return out;
 }
 
+/**
+ * Items built by Claude's script on the page: the extraction that used to be
+ * its own round trip ("list the ads, then judge them") runs inside this call.
+ */
+async function scriptItems(callTool, tabId, code, timeoutMs) {
+  const res = await callTool("javascript_tool", {
+    action: "javascript_exec", text: code, tabId,
+    ...(timeoutMs ? { timeout_ms: timeoutMs } : {})
+  });
+  const raw = resultText(res);
+  if (isToolError(res)) return { error: `items_script failed: ${raw.slice(0, 300)}` };
+  let value;
+  try {
+    value = JSON.parse(raw);
+    // A script that ends in JSON.stringify(...) returns a string of JSON.
+    if (typeof value === "string") value = JSON.parse(value);
+  } catch {
+    return { error: `items_script must end in an array of items; got: ${raw.slice(0, 200)}` };
+  }
+  if (!Array.isArray(value)) return { error: `items_script must end in an array of items; got ${typeof value}.` };
+  const bad = value.findIndex((it) => !it || typeof it !== "object");
+  if (bad >= 0) return { error: `items_script item ${bad + 1} is not an object.` };
+  return { items: value };
+}
+
 /** Backs the jev_assess tool. */
 export async function assess(callTool, client, cfg, args) {
   const {
-    tabId, items = [], questions, context = "", selector,
+    tabId, questions, context = "", selector,
     max_chars: maxChars = 4000, return_chars: returnChars = 300,
     allow_sensitive: allowSensitive = false
   } = args;
@@ -159,6 +134,13 @@ export async function assess(callTool, client, cfg, args) {
 
   const qErr = questionsError(questions);
   if (qErr) return { status: "error", reason: qErr };
+  let items = args.items ?? [];
+  if (args.items_script) {
+    if (typeof tabId !== "number") return { status: "error", reason: "items_script needs a tabId to run in." };
+    const built = await scriptItems(callTool, tabId, args.items_script, args.items_script_timeout_ms);
+    if (built.error) return { status: "error", reason: built.error };
+    items = [...items, ...built.items];
+  }
   if (!items.length) return { status: "error", reason: "No items to assess." };
   if (items.length > MAX_ITEMS) return { status: "error", reason: `At most ${MAX_ITEMS} items per call; got ${items.length}.` };
   const bare = items.findIndex((it) => !it.url && !it.goal && it.text == null);

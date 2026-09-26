@@ -24,6 +24,14 @@ import { noteActivity } from "./parent-watch.js";
 const PIPE_PATH = getPipePath();
 
 const REQUEST_TIMEOUT_MS = 60_000;
+// javascript_tool may ask the extension for up to 120s of evaluation; the host
+// waits that long plus slack so the extension's own timeout is the one reported.
+const JS_MAX_TIMEOUT_MS = 120_000;
+export function requestTimeoutMs(tool, args) {
+  if (tool !== "javascript_tool" || !args?.timeout_ms) return REQUEST_TIMEOUT_MS;
+  const ms = Math.min(Number(args.timeout_ms) || 0, JS_MAX_TIMEOUT_MS);
+  return Math.max(REQUEST_TIMEOUT_MS, ms + 10_000);
+}
 // The host dies and respawns whenever Chrome recycles the service worker, and
 // background.js reconnects 250ms later. A call landing in that window should
 // wait for the bridge to come back rather than fail.
@@ -174,10 +182,11 @@ function failPending() {
 function sendToExtension(tool, args) {
   return new Promise((resolve, reject) => {
     const id = String(++requestIdCounter);
+    const waitMs = requestTimeoutMs(tool, args);
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, REQUEST_TIMEOUT_MS);
+      reject(new Error(`Tool request timed out after ${Math.round(waitMs / 1000)}s`));
+    }, waitMs);
     const entry = { resolve, reject, timer, sent: false };
     pendingRequests.set(id, entry);
 

@@ -109,7 +109,7 @@ export const TOOLS = [
         .max(2)
         .optional()
         .describe(
-          "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."
+          "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates, in the pixels of the latest screenshot of this tab (mapped to the page for you). Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position. Prefer `ref` when read_page/find can name the element."
         ),
       duration: z
         .number()
@@ -301,12 +301,18 @@ export const TOOLS = [
       text: z
         .string()
         .describe(
-          "The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."
+          "The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). Top-level await is supported (e.g. 'await fetch(url).then(r => r.text())'). You can access and modify the DOM, call page functions, and interact with page variables."
         ),
       tabId: z
         .number()
         .describe(
           "Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+        ),
+      timeout_ms: z
+        .number()
+        .optional()
+        .describe(
+          "How long the script may run, in ms (default 20000, max 120000). Raise it for one script that fetches many pages, instead of splitting the work across calls."
         )
     }
   },

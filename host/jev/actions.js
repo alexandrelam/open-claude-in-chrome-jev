@@ -95,6 +95,9 @@ export function isCompatible(operation, row) {
   if (!OPERATIONS[operation]) return false;
   if (!OPERATIONS[operation].needsTarget) return true;
   if (!row) return false;
+  // A disabled control is on offer as context, never as a target: acting on
+  // it is a no-op the loop would misread as "the page didn't change".
+  if (row.disabled) return false;
   const role = (row.role || "").toLowerCase();
   switch (operation) {
     case "CLICK":

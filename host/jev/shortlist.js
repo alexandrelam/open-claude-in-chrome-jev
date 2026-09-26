@@ -38,6 +38,10 @@ export function renderRow(row, id) {
   for (const key of ["checked", "expanded", "selected"]) {
     if (row[key] !== undefined && row[key] !== "") extra.push(`${key}=${row[key]}`);
   }
+  if (row.required) extra.push("required");
+  // Said outright, not left to inference: a disabled Save is usually the
+  // reason a form leg is stuck, and Jev can only report that if it sees it.
+  if (row.disabled) extra.push("disabled");
   if (row.options?.length)
     extra.push(`options=${row.options.slice(0, 8).map((o) => o.label).join("/")}`);
   return extra.length ? `${line} | ${extra.join(" ")}` : line;

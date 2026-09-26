@@ -175,11 +175,27 @@ check("truncation marker is detected and not parsed as a row", () => {
   eq(page.rows.length, 2, "row count");
 });
 
-check("usableRows drops disabled controls", () => {
-  const { rows } = parsePage('button "Go" [ref_1]\nbutton "Nope" [ref_2] disabled');
+check("usableRows keeps disabled controls as context, marked", () => {
+  // Dropping them hid the reason a form was stuck: Save was disabled, so Jev
+  // could not see Save at all. isControl/isCompatible keep them from being
+  // targets; here they only have to survive.
+  const { rows } = parsePage('button "Go" [ref_1]\nbutton "Save" [ref_2] disabled');
   const usable = usableRows(rows);
-  eq(usable.length, 1, "one usable row");
-  eq(usable[0].ref, "ref_1", "kept the enabled one");
+  eq(usable.length, 2, "both kept");
+  eq(usable[1].disabled, true, "the disabled one is marked");
+});
+
+check("parseLine carries required, alongside disabled and section", () => {
+  const r = parseLine('combobox "Visit type" [ref_4] disabled required section="Details"');
+  eq(r.required, true, "required");
+  eq(r.disabled, true, "disabled");
+  eq(r.section, "Details", "section");
+  eq(parseLine('button "Go" [ref_1]').required, false, "absent means false");
+});
+
+check("the signature changes when a control becomes enabled", () => {
+  const obs = (disabled) => ({ url: "u", title: "t", rows: [{ role: "button", name: "Save", value: "", disabled }] });
+  assert(observationSignature(obs(true)) !== observationSignature(obs(false)), "enabling Save is progress");
 });
 
 check("usableRows collapses indistinguishable duplicates", () => {

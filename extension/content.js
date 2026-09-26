@@ -231,6 +231,30 @@
   // One interactive/visible element, as structured fields. The single source
   // of what a row says: read_page's text line is formatted from this, and
   // jev_snapshot returns it as-is, so the two cannot drift apart.
+  // Disabled the way a person experiences it: the control's own attribute, a
+  // <fieldset disabled> it sits in (:disabled inherits, .disabled does not),
+  // or an aria-disabled / inert ancestor, which is how component libraries
+  // disable a styled button that is not a real <button>.
+  function isEffectivelyDisabled(el) {
+    if (el.disabled) return true;
+    try {
+      if (el.matches(":disabled")) return true;
+    } catch {}
+    return Boolean(el.closest('[aria-disabled="true"],[inert]'));
+  }
+
+  // The text a custom select shows as its current choice. A styled combobox is
+  // a <div> with no value property, so without this an empty "Visit type"
+  // picker and a filled one render identically, and nothing can report that a
+  // required field was left blank.
+  function displayedChoice(el, tag, role, name) {
+    if (["input", "textarea", "select"].includes(tag)) return "";
+    const popup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
+    if (role !== "combobox" && popup !== "listbox") return "";
+    const shown = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    return shown && shown !== name ? shown.substring(0, 100) : "";
+  }
+
   function describeRow(el, tag, role, name, landmark) {
     const row = { ref: getOrAssignRef(el), role: role || "", name: name ? name.substring(0, 100) : "" };
     if (tag === "a" && el.href) row.href = el.href;
@@ -241,7 +265,12 @@
     if (el.getAttribute("aria-checked")) row.checked = el.getAttribute("aria-checked");
     else if (tag === "input" && (el.type === "checkbox" || el.type === "radio")) row.checked = el.checked;
     if (el.getAttribute("aria-selected")) row.selected = el.getAttribute("aria-selected");
-    if (el.disabled) row.disabled = true;
+    if (!row.value) {
+      const shown = displayedChoice(el, tag, role, name);
+      if (shown) row.value = shown;
+    }
+    if (isEffectivelyDisabled(el)) row.disabled = true;
+    if (el.required || el.getAttribute("aria-required") === "true") row.required = true;
     // Which part of the page this control belongs to. Without it a form of
     // repeated cards is an undifferentiated list in which the same label
     // appears once per card and none of them can be told apart.
@@ -266,6 +295,7 @@
     if (row.checked !== undefined) line += ` checked=${row.checked}`;
     if (row.selected) line += ` selected=${row.selected}`;
     if (row.disabled) line += " disabled";
+    if (row.required) line += " required";
     if (row.section) line += ` section="${row.section}"`;
     if (row.options) {
       line += ` options=[${row.options.map((o) => `${o.selected ? "*" : " "}${o.value}="${o.label}"`).join(", ")}]`;
@@ -464,7 +494,7 @@
   function jevGuard(ref, expect = {}) {
     const el = resolveRef(ref);
     if (!el || !el.isConnected) return { ok: false, reason: `${ref} is no longer on the page` };
-    if (el.disabled || el.closest('[aria-disabled="true"],[inert]')) return { ok: false, reason: `${ref} is now disabled` };
+    if (isEffectivelyDisabled(el)) return { ok: false, reason: `${ref} is now disabled` };
     if (isHiddenFromA11y(el) || !isVisible(el)) return { ok: false, reason: `${ref} is no longer visible` };
     const role = getRole(el) || "";
     const name = getAccessibleName(el).substring(0, 100).replace(/\s+/g, " ").trim();

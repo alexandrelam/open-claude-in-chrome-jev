@@ -414,6 +414,8 @@ async function ensureDomain(tabId, domain) {
 // block indefinitely; bound every command so a stuck one fails fast and
 // surfaces as a tool error the agent can react to, instead of a silent stall.
 const CDP_TIMEOUT_MS = 20000;
+// javascript_tool's own ceiling; host/tool-runtime.js waits this plus slack.
+const JS_MAX_TIMEOUT_MS = 120000;
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -422,13 +424,13 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function cdp(tabId, method, params = {}) {
+async function cdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
   await ensureAttached(tabId);
   const t0 = Date.now();
   try {
     const out = await withTimeout(
       chrome.debugger.sendCommand({ tabId }, method, params),
-      CDP_TIMEOUT_MS,
+      timeoutMs,
       `CDP ${method}`
     );
     dbg("cdp", `${method}${cdpDetail(method, params)}`, { tab: tabId, ms: Date.now() - t0 });
@@ -740,10 +742,17 @@ async function resolveRefToCoordinates(tabId, ref, opts = {}) {
 }
 
 // --- Screenshot helper ---
-// Cap viewport to 1280x800 for screenshots to keep size manageable.
-// Retina displays produce 2x+ resolution PNGs that blow up base64 size.
+// Screenshots are never wider than this. Clients rescale a wide image before
+// the model sees it (a 1593 px capture was shown at about 1024), and a
+// coordinate read off the rescaled picture then lands somewhere else: in an
+// audited run the model's dropdown clicks all missed while ref clicks worked.
+// Downscaling here, and mapping incoming coordinates back (imageScaleByTab),
+// keeps the picture the model reads and the space it clicks in the same.
 const MAX_SCREENSHOT_WIDTH = 1280;
-const MAX_SCREENSHOT_HEIGHT = 800;
+
+// tabId -> CSS pixels per screenshot pixel, from the last screenshot of that
+// tab. Coordinates passed to the computer tool are read in screenshot pixels.
+const imageScaleByTab = new Map();
 
 async function takeScreenshot(tabId) {
   await ensureAttached(tabId);
@@ -761,6 +770,7 @@ async function takeScreenshot(tabId) {
   // whose pixels ARE CSS pixels. Emulation would also achieve this, but at the
   // cost of freezing the viewport (see ensureAttached).
   let clip = null;
+  let imageSize = "";
   try {
     const vp = await cdp(tabId, "Runtime.evaluate", {
       expression: "JSON.stringify([innerWidth, innerHeight, devicePixelRatio])",
@@ -768,7 +778,10 @@ async function takeScreenshot(tabId) {
     });
     const [vw, vh, dpr] = JSON.parse(vp.result.value);
     if (vw > 0 && vh > 0) {
-      clip = { x: 0, y: 0, width: vw, height: vh, scale: 1 / (dpr > 0 ? dpr : 1) };
+      const fit = vw > MAX_SCREENSHOT_WIDTH ? MAX_SCREENSHOT_WIDTH / vw : 1;
+      clip = { x: 0, y: 0, width: vw, height: vh, scale: fit / (dpr > 0 ? dpr : 1) };
+      imageScaleByTab.set(tabId, 1 / fit);
+      imageSize = `${Math.round(vw * fit)}x${Math.round(vh * fit)}`;
     }
   } catch {}
 
@@ -792,7 +805,7 @@ async function takeScreenshot(tabId) {
   // this image is trusting every one of those.
   dbg(
     "cdp",
-    `screenshot ${clip ? `${clip.width}x${clip.height} CSS px, dpr ${Math.round((1 / clip.scale) * 100) / 100}, clip scale ${Math.round(clip.scale * 1000) / 1000}` : "NO CLIP — image is in device pixels, not CSS pixels"}` +
+    `screenshot ${clip ? `${clip.width}x${clip.height} CSS px -> ${imageSize} image, clip scale ${Math.round(clip.scale * 1000) / 1000}, ${imageScaleByTab.get(tabId)} CSS px per image px` : "NO CLIP — image is in device pixels, not CSS pixels"}` +
       ` -> ${Math.round((base64.length * 3) / 4 / 1024)}KB${base64.length > 350000 ? " (after quality retry)" : ""}`,
     { tab: tabId }
   );
@@ -805,7 +818,7 @@ async function takeScreenshot(tabId) {
     screenshotStore.delete(keys.shift());
   }
 
-  return { base64, imageId };
+  return { base64, imageId, imageSize };
 }
 
 // Write a captured base64 screenshot to disk via the native host and resolve
@@ -1506,7 +1519,17 @@ const toolHandlers = {
     const { action, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
-    let coordinate = args.coordinate;
+    // Coordinates the caller passes are in screenshot pixels; everything below
+    // dispatches in CSS pixels. `shown` maps back for the replies, so the
+    // numbers the caller reads are in the space it reads the picture in.
+    const cssPerImagePx = imageScaleByTab.get(tabId) ?? 1;
+    const toCss = (p) =>
+      Array.isArray(p) && p.length === 2 && cssPerImagePx !== 1
+        ? [Math.round(p[0] * cssPerImagePx), Math.round(p[1] * cssPerImagePx)]
+        : p;
+    const shown = (p) => `(${Math.round(p[0] / cssPerImagePx)}, ${Math.round(p[1] / cssPerImagePx)})`;
+    let coordinate = toCss(args.coordinate);
+    const startCoordinate = toCss(args.start_coordinate);
     // Resolve ref to coordinates if provided. This scrolls the element into
     // view first: coordinates are viewport-relative, so an element that is off
     // screen has coordinates no dispatch can reach, and the click would land on
@@ -1554,16 +1577,16 @@ const toolHandlers = {
       const probe = await probeHit(tabId, coordinate[0], coordinate[1]);
       hitNote = hitNote_(probe);
       dbg("hit", `@(${coordinate[0]},${coordinate[1]}) ${formatHit(probe)}`, { tab: tabId, x: coordinate[0], y: coordinate[1] });
-    } else if (action === "left_click_drag" && args.start_coordinate) {
-      const probe = await probeHit(tabId, args.start_coordinate[0], args.start_coordinate[1]);
+    } else if (action === "left_click_drag" && startCoordinate) {
+      const probe = await probeHit(tabId, startCoordinate[0], startCoordinate[1]);
       hitNote = hitNote_(probe);
-      dbg("hit", `drag start @(${args.start_coordinate[0]},${args.start_coordinate[1]}) ${formatHit(probe)}`,
-          { tab: tabId, x: args.start_coordinate[0], y: args.start_coordinate[1] });
+      dbg("hit", `drag start @(${startCoordinate[0]},${startCoordinate[1]}) ${formatHit(probe)}`,
+          { tab: tabId, x: startCoordinate[0], y: startCoordinate[1] });
     }
 
     switch (action) {
       case "screenshot": {
-        const { base64, imageId } = await takeScreenshot(tabId);
+        const { base64, imageId, imageSize } = await takeScreenshot(tabId);
         // Get viewport dimensions for the response message
         let dims = "";
         try {
@@ -1587,15 +1610,14 @@ const toolHandlers = {
           content: [
             {
               type: "text",
-              // The image you are shown is rescaled to your client's width,
-              // while clicks are dispatched in the page's own CSS pixels. Read
-              // a coordinate off the picture and it lands somewhere else — in
-              // one audited run the first click opened the wrong menu. Say the
-              // real space, and point at the way that cannot go wrong.
+              // Coordinates are taken in this image's own pixels and mapped to
+              // the page (see imageScaleByTab), so say what the image is. A
+              // client may still shrink it further before showing it; ref
+              // clicks are immune to all of this.
               text:
-                `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}${saveNote}` +
-                (dims
-                  ? `\nCoordinates are in CSS pixels of a ${dims} viewport, NOT in the pixel dimensions of the image as displayed to you — scale accordingly, or avoid the problem entirely by clicking with \`ref\` from read_page/find instead of \`coordinate\`.`
+                `Successfully captured screenshot (${imageSize || dims}, jpeg) - ID: ${imageId}${saveNote}` +
+                (imageSize
+                  ? `\nThe image is ${imageSize} px${dims && dims !== imageSize ? ` (page viewport ${dims} CSS px)` : ""}. Coordinates you pass are read in THIS image's pixels and mapped to the page for you. Clicking with \`ref\` from read_page/find is still more reliable than any coordinate.`
                   : ""),
             },
             { type: "image", data: base64, mimeType: "image/jpeg" },
@@ -1606,7 +1628,7 @@ const toolHandlers = {
       case "left_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
-        return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
+        return { content: [{ type: "text", text: `Clicked at ${shown(coordinate)}${hitNote}` }] };
       }
 
       // Hidden diagnostic (not in the tool schema): serially times every CDP
@@ -1635,19 +1657,19 @@ const toolHandlers = {
       case "right_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for right_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { button: "right", modifiers });
-        return { content: [{ type: "text", text: `Right-clicked at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
+        return { content: [{ type: "text", text: `Right-clicked at ${shown(coordinate)}${hitNote}` }] };
       }
 
       case "double_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 2, modifiers });
-        return { content: [{ type: "text", text: `Double-clicked at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
+        return { content: [{ type: "text", text: `Double-clicked at ${shown(coordinate)}${hitNote}` }] };
       }
 
       case "triple_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 3, modifiers });
-        return { content: [{ type: "text", text: `Triple-clicked at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
+        return { content: [{ type: "text", text: `Triple-clicked at ${shown(coordinate)}${hitNote}` }] };
       }
 
       case "hover": {
@@ -1659,14 +1681,14 @@ const toolHandlers = {
           const s = human(effectiveConfig(tabId).humanize_speed, effectiveConfig(tabId).humanize_seed);
           const from = cursorByTab.get(tabId) || { x: Math.max(0, coordinate[0] - 200), y: Math.max(0, coordinate[1] - 150) };
           await dispatchPlan(tabId, humanize.planHover(s, from, { x: coordinate[0], y: coordinate[1] }), modifiers);
-          return { content: [{ type: "text", text: `Hovered at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
+          return { content: [{ type: "text", text: `Hovered at ${shown(coordinate)}${hitNote}` }] };
         }
         await dispatchMouse(tabId, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
         cursorByTab.set(tabId, { x: coordinate[0], y: coordinate[1] });
         // Let the page apply the hover state; Brave additionally needs a settle
         // window, Chrome doesn't.
         if (await isBrave()) await sleep(200);
-        return { content: [{ type: "text", text: `Hovered at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
+        return { content: [{ type: "text", text: `Hovered at ${shown(coordinate)}${hitNote}` }] };
       }
 
       case "type": {
@@ -1810,7 +1832,7 @@ const toolHandlers = {
         // block, so bound it and degrade to a text-only result rather than
         // stalling the whole scroll (and the agent's retries) to the 60s cap.
         const scrollContent = [
-          { type: "text", text: `Scrolled ${dir} by ${amount} ticks at (${coordinate[0]}, ${coordinate[1]})${hitNote}` },
+          { type: "text", text: `Scrolled ${dir} by ${amount} ticks at ${shown(coordinate)}${hitNote}` },
         ];
         try {
           const { base64 } = await withTimeout(takeScreenshot(tabId), 6000, "scroll screenshot");
@@ -1847,16 +1869,16 @@ const toolHandlers = {
       }
 
       case "left_click_drag": {
-        if (!args.start_coordinate || !coordinate) {
+        if (!startCoordinate || !coordinate) {
           return { content: [{ type: "text", text: "start_coordinate and coordinate are required for left_click_drag" }] };
         }
-        const [sx, sy] = args.start_coordinate;
+        const [sx, sy] = startCoordinate;
         const [ex, ey] = coordinate;
         if (await humanizeOn(tabId)) {
           const s = human(effectiveConfig(tabId).humanize_speed, effectiveConfig(tabId).humanize_seed);
           const from = cursorByTab.get(tabId) || { x: sx, y: sy };
           await dispatchPlan(tabId, humanize.planDrag(s, from, { x: sx, y: sy }, { x: ex, y: ey }), modifiers);
-          return { content: [{ type: "text", text: `Dragged from (${sx}, ${sy}) to (${ex}, ${ey})${hitNote}` }] };
+          return { content: [{ type: "text", text: `Dragged from ${shown([sx, sy])} to ${shown([ex, ey])}${hitNote}` }] };
         }
         await dispatchMouse(tabId, "mouseMoved", sx, sy, { modifiers });
         if (await isBrave()) await sleep(50);
@@ -1871,7 +1893,7 @@ const toolHandlers = {
           if (await isBrave()) await sleep(20);
         }
         await dispatchMouse(tabId, "mouseReleased", ex, ey, { button: "left", modifiers });
-        return { content: [{ type: "text", text: `Dragged from (${sx}, ${sy}) to (${ex}, ${ey})${hitNote}` }] };
+        return { content: [{ type: "text", text: `Dragged from ${shown([sx, sy])} to ${shown([ex, ey])}${hitNote}` }] };
       }
 
       case "zoom": {
@@ -2165,6 +2187,10 @@ const toolHandlers = {
 
   async javascript_tool(args) {
     const { text, tabId } = args;
+    // A script that walks many pages (fetch every result page, then every ad)
+    // outlives the 20s CDP bound; the caller may extend it, up to what the
+    // host will wait for.
+    const timeoutMs = Math.min(Math.max(Number(args.timeout_ms) || CDP_TIMEOUT_MS, 1000), JS_MAX_TIMEOUT_MS);
     const tIn = Date.now();
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
@@ -2175,7 +2201,10 @@ const toolHandlers = {
         expression: text,
         returnByValue: true,
         awaitPromise: true,
-      });
+        // REPL semantics: top-level await works, and a const/let from an
+        // earlier call can be redeclared instead of throwing.
+        replMode: true,
+      }, timeoutMs);
       // preMs = group check + debugger attach; evalMs = the evaluate alone.
       // The split is the whole point: it separates "the renderer serviced the
       // task late" from every other stage of the pipe.

@@ -27,6 +27,8 @@ import {
   namesAgree
 } from "./actions.js";
 import { shortlistRows, renderRow } from "./shortlist.js";
+import { termsFrom, lexicalScore, prefilter } from "./relevance.js";
+import { buildQuestions, questionsError, compactAnswer } from "./questions.js";
 import { MAX_CHOICES } from "./config.js";
 import { createTrace } from "./trace.js";
 import { BudgetExceeded } from "./client.js";
@@ -110,6 +112,23 @@ export function domainAllowed(url, cfg) {
   return cfg.allowedDomains.some(matches);
 }
 
+// An option that only asks to be replaced: "Select…", "-- choose --", "".
+const PLACEHOLDER = /^(|select\b.*|choose\b.*|pick\b.*|--.*|none|n\/a)$/i;
+
+/**
+ * The option fill_defaults picks for a native select given no value: the
+ * first one that is a real choice and is not already chosen. Undefined when
+ * there is none, in which case the step still asks Claude for a value.
+ */
+export function defaultOption(row) {
+  return (row?.options ?? []).find(
+    (o) => !o.selected && String(o.value ?? "").trim() !== "" && !PLACEHOLDER.test(String(o.label ?? "").trim())
+  );
+}
+
+const DEFAULTS_NOTE =
+  "Any valid option is acceptable for a choice field (select, combobox, radio, checkbox) that has no provided value. Free text still needs a provided value.";
+
 /**
  * Build the Jev request for one step: the state it reasons over and the four
  * questions, which are answered in parallel inside a single round trip.
@@ -117,7 +136,7 @@ export function domainAllowed(url, cfg) {
  * Rows are addressed as e1..eN, not as ref_N. The mapping back to refs stays in
  * this process, so a ref Jev was not offered cannot come back out of it.
  */
-export function buildRequest(obs, rows, { goal, successCriteria, values }, next = null) {
+export function buildRequest(obs, rows, { goal, successCriteria, values, fillDefaults = false, history = [] }, next = null) {
   const idMap = new Map();
   // Last line of defence against the provider's 255-option ceiling. The config
   // clamp normally keeps us well under it; this makes a malformed request
@@ -146,6 +165,11 @@ export function buildRequest(obs, rows, { goal, successCriteria, values }, next 
     elements,
     values: valueKeys
   };
+  // What this leg already did. Without it every decision is made from scratch,
+  // and on the audited admin page Jev clicked "New template" three times in a
+  // row because each look at the open form still read as "not open yet".
+  if (history.length) state.history = history;
+  if (fillDefaults) state.defaults = DEFAULTS_NOTE;
 
   const questions = goalQuestions(idMap, obs.scroll, { successCriteria, values }, "", "");
 
@@ -160,7 +184,9 @@ export function buildRequest(obs, rows, { goal, successCriteria, values }, next 
   if (next) {
     const preamble =
       `Assume the current goal is already complete. The NEXT goal is: ${next.goal}. ` +
-      `Its success criteria: ${next.successCriteria}. Answer for that NEXT goal. `;
+      `Its success criteria: ${next.successCriteria}. ` +
+      (next.fillDefaults ? `${DEFAULTS_NOTE} ` : "") +
+      `Answer for that NEXT goal. `;
     Object.assign(questions, goalQuestions(idMap, obs.scroll, next, "next_", preamble));
   }
 
@@ -265,7 +291,7 @@ export function answersFor(answers, prefix) {
  * Never skipped, and deliberately ordered so the cheapest structural failures
  * (unknown operation, unknown ref) are caught before the judgement calls.
  */
-export function validate(answers, idMap, cfg, { allowSensitive, values }) {
+export function validate(answers, idMap, cfg, { allowSensitive, values, fillDefaults = false }) {
   const opAns = answers.operation;
   if (!opAns?.choice || !OPERATIONS[opAns.choice]) {
     return { ok: false, status: "needs_help", reason: `Jev returned an unknown operation: ${opAns?.choice}` };
@@ -331,7 +357,15 @@ export function validate(answers, idMap, cfg, { allowSensitive, values }) {
   let value;
   if (spec.needsValue) {
     const key = answers.value_key?.choice;
-    if (!key || key === NONE || !(key in (values || {}))) {
+    const fits = key && key !== NONE && key in (values || {});
+    // Choice fields only. A select's options are the page's own values, so
+    // picking one invents nothing; a text field would need Jev to write text,
+    // which it never does.
+    const fallback = !fits && fillDefaults && operation === "SELECT" ? defaultOption(row) : undefined;
+    if (fallback) {
+      return { ok: true, operation, row, value: String(fallback.value), confidence, sensitive: sensitiveByModel || sensitiveByLabel, demotedFrom, defaulted: true };
+    }
+    if (!fits) {
       return {
         ok: false, status: "needs_value", operation, row, confidence,
         reason: `${operation} needs a value for ${rowLabel(row)} (role ${row?.role || "unknown"}${row?.type ? `, type ${row.type}` : ""}), and none of the provided values fits. Supply one in \`values\` and call again.`
@@ -343,8 +377,8 @@ export function validate(answers, idMap, cfg, { allowSensitive, values }) {
   return { ok: true, operation, row, value, confidence, sensitive: sensitiveByModel || sensitiveByLabel, demotedFrom };
 }
 
-async function observeOrFail(callTool, tabId, cfg) {
-  const obs = await observe(callTool, tabId);
+async function observeOrFail(callTool, tabId, cfg, opts = {}) {
+  const obs = await observe(callTool, tabId, opts);
   if (obs.error) return { obs: null, failure: { status: "blocked", reason: obs.error } };
   if (!domainAllowed(obs.url, cfg)) {
     return {
@@ -380,6 +414,7 @@ function topTargets(probabilities, idMap, n) {
 /** One observation + one decision, with no action. Backs the jev_decide tool. */
 export async function decideOnce(callTool, client, cfg, args) {
   const { tabId, goal, success_criteria: successCriteria, values, allow_sensitive } = args;
+  const fillDefaults = Boolean(args.fill_defaults);
   const { obs, failure } = await observeOrFail(callTool, tabId, cfg);
   if (failure) return { status: failure.status, reason: failure.reason };
 
@@ -387,9 +422,9 @@ export async function decideOnce(callTool, client, cfg, args) {
     goal, successCriteria, values, maxRows: cfg.maxRows, pageUrl: obs.url,
     decide: (s, q) => client.decide(s, q)
   });
-  const { state, questions, idMap } = buildRequest(obs, short.rows, { goal, successCriteria, values });
+  const { state, questions, idMap } = buildRequest(obs, short.rows, { goal, successCriteria, values, fillDefaults });
   const { answers, ms, usage } = await client.decide(state, questions);
-  const verdict = validate(answers, idMap, cfg, { allowSensitive: allow_sensitive, values });
+  const verdict = validate(answers, idMap, cfg, { allowSensitive: allow_sensitive, values, fillDefaults });
 
   return {
     status: verdict.ok ? "proposed" : verdict.status,
@@ -425,16 +460,71 @@ export function normalizeSubgoals(args) {
       goal: sg.goal,
       successCriteria: sg.success_criteria ?? sg.successCriteria,
       values: sg.values ?? args.values ?? {},
-      optional: sg.optional ?? null
+      optional: sg.optional ?? null,
+      fillDefaults: Boolean(sg.fill_defaults ?? args.fill_defaults ?? false)
     }));
   }
   return [
     {
       goal: args.goal,
       successCriteria: args.success_criteria ?? args.successCriteria,
-      values: args.values ?? {}
+      values: args.values ?? {},
+      fillDefaults: Boolean(args.fill_defaults ?? false)
     }
   ];
+}
+
+const FIELD_ROLES = new Set(["textbox", "searchbox", "combobox", "listbox", "select", "spinbutton", "textarea"]);
+
+function isField(row) {
+  const role = (row.role || "").toLowerCase();
+  if (["checkbox", "radio", "switch", "button", "submit", "reset", "hidden"].includes((row.type || "").toLowerCase())) return false;
+  return FIELD_ROLES.has(role) || Array.isArray(row.options) || Boolean(row.type);
+}
+
+function looksEmpty(row) {
+  const selected = row.options?.find((o) => o.selected);
+  if (selected) return PLACEHOLDER.test(String(selected.label ?? "").trim()) || String(selected.value ?? "") === "";
+  return PLACEHOLDER.test(String(row.value ?? "").trim());
+}
+
+const brief = (r) => ({ ref: r.ref, role: r.role, name: r.name, ...(r.section ? { section: r.section } : {}), ...(r.required ? { required: true } : {}) });
+
+/**
+ * Why a leg is stuck, when the page shows it: the disabled controls its goal
+ * names, and the empty fields around them.
+ *
+ * The audited run stopped with "Confidence 0.52 is below the 0.6 threshold for
+ * CLICK on button New template" while the real story was on screen: Save was
+ * disabled because Visit type and Format were empty. Claude had to take a
+ * screenshot to learn that, then finished the form by hand. Said in the
+ * reason, it is a one-call fix: add legs for the fields, then retry.
+ *
+ * Returns null when nothing on the page explains the stop.
+ */
+export function diagnoseStop(obs, sub) {
+  const rows = obs?.allRows ?? obs?.rows ?? [];
+  const terms = termsFrom(sub?.goal, sub?.successCriteria);
+  const disabled = rows
+    .filter((r) => r.disabled && r.name && lexicalScore({ ...r, section: "", href: "" }, terms) > 0)
+    .slice(0, 3);
+  if (!disabled.length) return null;
+
+  const sections = new Set(disabled.map((r) => r.section).filter(Boolean));
+  const empty = rows
+    .filter((r) => !r.disabled && isField(r) && looksEmpty(r))
+    .map((r, i) => ({ r, rank: (r.required ? 0 : 2) + (sections.size && !sections.has(r.section) ? 1 : 0), i }))
+    .sort((a, b) => a.rank - b.rank || a.i - b.i)
+    .slice(0, 8)
+    .map(({ r }) => r);
+
+  const names = (list) => list.map((r) => `"${r.name || r.ref}" (${r.role || "field"}, ${r.ref})`).join(", ");
+  const summary =
+    `${disabled.map((r) => `"${r.name}"`).join(", ")} ${disabled.length > 1 ? "are" : "is"} disabled on this page.` +
+    (empty.length
+      ? ` Fields that look empty: ${names(empty)}. Add legs that fill them (or set fill_defaults for choice fields) before the leg that stopped, then call again.`
+      : " Nothing on the page looks empty, so something else has to happen first.");
+  return { disabled: disabled.map(brief), empty: empty.map(brief), summary };
 }
 
 /**
@@ -447,9 +537,11 @@ export function normalizeSubgoals(args) {
 async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
   const { tabId, allowSensitive, maxSteps, trace, next } = opts;
   let carry = opts.carry ?? null;
-  const { goal, successCriteria, values } = sub;
+  const { goal, successCriteria, values, fillDefaults = false } = sub;
 
   const steps = [];
+  // The last few actions, fed back to Jev on every decision (see buildRequest).
+  const history = [];
   let lastSignature = null;
   let unchangedStreak = 0;
   const actionCounts = new Map();
@@ -467,7 +559,20 @@ async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
     recovered.push(why);
     return true;
   };
-  const stop = (status, reason, extra = {}) => ({ status, reason, steps, recovered, ...extra });
+  const stop = (status, reason, extra = {}) => {
+    // A leg that stops without finishing says what is in the way when the page
+    // shows it: a disabled control the goal names, and the empty fields that
+    // are probably why. Not for a fatal stop (time, budget, a lost page),
+    // where the page is beside the point.
+    if (status !== "done" && !extra.fatal && ctx.obs) {
+      const blockers = diagnoseStop(ctx.obs, sub);
+      if (blockers) {
+        reason = reason ? `${reason} ${blockers.summary}` : blockers.summary;
+        extra = { ...extra, blockers: { disabled: blockers.disabled, empty: blockers.empty } };
+      }
+    }
+    return { status, reason, steps, recovered, ...extra };
+  };
 
   // Observing is read-only and idempotent, so a failure is worth retrying.
   //
@@ -537,7 +642,7 @@ async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
           pageUrl: obs.url,
           decide: (st, q) => client.decide(st, q)
         });
-        request = buildRequest(obs, short.rows, { goal, successCriteria, values }, ask);
+        request = buildRequest(obs, short.rows, { goal, successCriteria, values, fillDefaults, history: history.slice(-3) }, ask);
         const res = await client.decide(request.state, request.questions);
         answers = res.answers;
         jevMs = res.ms;
@@ -547,7 +652,7 @@ async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
         if (err instanceof BudgetExceeded) return stop("limit_reached", err.message, { fatal: true });
         return stop("needs_help", `Jev request failed: ${err?.message ?? err}`);
       }
-      verdict = validate(answers, request.idMap, cfg, { allowSensitive, values });
+      verdict = validate(answers, request.idMap, cfg, { allowSensitive, values, fillDefaults });
     }
 
     const contradiction = urlContradicts(successCriteria, obs.url);
@@ -637,6 +742,7 @@ async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
       i: ++ctx.actionNo, operation: verdict.operation, target_ref: verdict.row?.ref ?? null,
       target_label: rowLabel(verdict.row), confidence: Number(verdict.confidence.toFixed(3)),
       ...(verdict.demotedFrom ? { demoted_from: verdict.demotedFrom } : {}),
+      ...(verdict.defaulted ? { defaulted_value: verdict.value } : {}),
       ms: Date.now() - stepStart
     });
 
@@ -726,6 +832,12 @@ async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
     }
     lastSignature = sig;
     ctx.obs = after;
+    history.push({
+      operation: verdict.operation,
+      target: rowLabel(verdict.row),
+      ...(verdict.value !== undefined ? { value: verdict.value } : {}),
+      page_changed: sig !== before
+    });
   }
 
   return stop("limit_reached", `Step limit of ${maxSteps} reached for this subgoal.`);
@@ -742,15 +854,43 @@ async function runSubgoal(callTool, client, cfg, sub, opts, ctx) {
 function carryFor(allAnswers, request, short, obs, next, cfg, allowSensitive) {
   const answers = answersFor(allAnswers, "next_");
   if (!answers.operation) return null;
-  const verdict = validate(answers, request.idMap, cfg, { allowSensitive, values: next.values });
+  const verdict = validate(answers, request.idMap, cfg, { allowSensitive, values: next.values, fillDefaults: next.fillDefaults });
   const satisfied = urlContradicts(next.successCriteria, obs.url) ? 0 : answers.satisfied?.noul ?? 0;
   if (!verdict.ok && !(satisfied > 0.5)) return null;
   return { obs, short, request, answers, verdict };
 }
 
+/**
+ * The page's controls as Claude should see them on hand-back: by real ref, so
+ * a fallback click can use `ref` instead of reading coordinates off a
+ * screenshot; disabled ones included and marked; the rows the stuck leg names
+ * first, then what is on screen. Kept in document order.
+ */
+export function handbackRows(obs, sub, limit) {
+  const rows = obs?.allRows ?? obs?.rows ?? [];
+  const terms = termsFrom(sub?.goal, sub?.successCriteria);
+  const tier = (r) => (lexicalScore(r, terms) > 0 ? 0 : r.inView === false ? 2 : 1);
+  return rows
+    .map((r, i) => ({ r, i, t: tier(r) }))
+    .filter(({ r }) => r.role || r.name || r.href)
+    .sort((a, b) => a.t - b.t || a.i - b.i)
+    .slice(0, limit)
+    .sort((a, b) => a.i - b.i)
+    .map(({ r }) => renderRow(r, r.ref));
+}
+
 /** The full loop over one or more subgoals. Backs the jev_navigate tool. */
 export async function navigate(callTool, client, cfg, args) {
   const { tabId, values = {}, start_url: startUrl, allow_sensitive: allowSensitive = false } = args;
+  const questions = Array.isArray(args.questions) && args.questions.length ? args.questions : null;
+
+  // Refused before anything is opened or clicked, as jev_assess does.
+  if (questions) {
+    const qErr =
+      questionsError(questions) ??
+      (questions.some((q) => q.key === "verified") ? 'Question key "verified" is reserved for final_check; use another name.' : null);
+    if (qErr) return { status: "error", reason: qErr };
+  }
 
   const subgoals = normalizeSubgoals(args);
   // max_steps bounds each subgoal so one runaway leg cannot eat the whole call;
@@ -774,6 +914,12 @@ export async function navigate(callTool, client, cfg, args) {
   const allSteps = [];
   let status = "done";
   let reason = null;
+  // Set when a leg stops the run: what is in the way, and the legs after it,
+  // echoed verbatim so Claude can re-call with [fix-up legs, ...remaining].
+  let blockers = null;
+  let remaining = null;
+  let stoppedLeg = null;
+  let answers = null;
 
   const finish = () => {
     const obs = ctx.obs;
@@ -794,10 +940,15 @@ export async function navigate(callTool, client, cfg, args) {
       reason,
       // The final page, so Claude can carry on without spending a turn on
       // read_page just to find out where the loop left the tab.
+      ...(answers ? { answers } : {}),
+      ...(blockers ? { blockers } : {}),
+      ...(remaining ? { remaining_subgoals: remaining } : {}),
       page_excerpt: obs
         ? {
             url: obs.url, title: obs.title, text: obs.excerpt,
-            interactive: obs.rows.slice(0, 40).map((r, k) => renderRow(r, `e${k + 1}`))
+            // Rendered by ref, not e-id: these are what Claude acts on if it
+            // has to take a step itself. More of them when it will.
+            interactive: handbackRows(obs, stoppedLeg, status === "done" ? 40 : 80)
           }
         : null,
       // wall ≈ jev + browser + settle. settle is time spent deliberately
@@ -848,6 +999,7 @@ export async function navigate(callTool, client, cfg, args) {
     const skip = leg.status !== "done" && !leg.fatal && (sub.optional ?? continueOnFailure);
     legs.push({
       i: idx + 1, goal: sub.goal, status: leg.status, steps: leg.steps, reason: leg.reason,
+      ...(leg.blockers ? { blockers: leg.blockers } : {}),
       ...(leg.recovered?.length ? { recovered: leg.recovered } : {}),
       ...(skip ? { skipped: true } : {})
     });
@@ -863,6 +1015,11 @@ export async function navigate(callTool, client, cfg, args) {
     if (leg.status !== "done") {
       if (subgoals.length > 1) {
         reason = `Subgoal ${idx + 1} of ${subgoals.length} ("${sub.goal}") stopped: ${leg.reason}`;
+      }
+      stoppedLeg = sub;
+      blockers = leg.blockers ?? null;
+      if (Array.isArray(args.subgoals) && idx + 1 < args.subgoals.length) {
+        remaining = args.subgoals.slice(idx + 1);
       }
       stopped = true;
       break;
@@ -893,47 +1050,75 @@ export async function navigate(callTool, client, cfg, args) {
   // app does: turning on "Split by problem" resets the section style a previous
   // leg had just set. One question against the whole intended end state is the
   // only thing that catches it.
-  if (status === "done" && finalCheck) {
+  //
+  // Claude's own questions ride in the same request. They are how a task ends
+  // in verification without Claude reading the page: "is the Enable switch
+  // off?" was thirteen manual calls in the audited run. Asked only when the
+  // run got where it was going; on a page a leg stopped at, the answers would
+  // describe the wrong place.
+  // final_check only judges a run that claims to be done; questions are
+  // answered on a partial run too, since skipped legs were optional ones.
+  const checkEnd = status === "done" ? finalCheck : null;
+  const askQuestions = (status === "done" || status === "partial") ? questions : null;
+  if (checkEnd || askQuestions) {
     const { obs: finalObs } = await (async () => {
       const t = Date.now();
-      const r = await observeOrFail(callTool, tabId, runCfg);
+      // A wider excerpt than a step gets. The 300-char cap exists because more
+      // prose dilutes an ACTION decision; these questions are about the page's
+      // content, which the controls alone often do not show.
+      const r = await observeOrFail(callTool, tabId, runCfg, { excerptChars: 1500 });
       ctx.browserMs += Date.now() - t;
       return r;
     })();
     if (finalObs) ctx.obs = finalObs;
+    const jevQuestions = {};
+    if (askQuestions) Object.assign(jevQuestions, buildQuestions(askQuestions));
+    if (checkEnd) {
+      jevQuestions.verified = {
+        type: "noul",
+        instructions: `Is ALL of this true of the page right now: ${checkEnd}`,
+        criteria: {
+          true: "Every part of the intended end state is visibly in place",
+          false: "Some part of it is missing, or was undone"
+        }
+      };
+    }
+    // The rows the questions name, when the page has more than fit.
+    const rows = prefilter(ctx.obs?.rows ?? [], {
+      goal: [checkEnd, ...(askQuestions ?? []).map((q) => q.question)].filter(Boolean).join(" "),
+      limit: runCfg.maxRows,
+      pageUrl: ctx.obs?.url
+    }).rows;
     try {
       const t = Date.now();
-      const { answers } = await client.decide(
+      const { answers: got } = await client.decide(
         {
-          intended_end_state: finalCheck,
+          ...(checkEnd ? { intended_end_state: checkEnd } : {}),
           url: ctx.obs?.url,
           title: ctx.obs?.title,
           page_excerpt: ctx.obs?.excerpt,
-          elements: (ctx.obs?.rows ?? [])
-            .slice(0, runCfg.maxRows)
-            .map((r, k) => renderRow(r, `e${k + 1}`))
+          elements: rows.map((r, k) => renderRow(r, `e${k + 1}`))
         },
-        {
-          verified: {
-            type: "noul",
-            instructions: `Is ALL of this true of the page right now: ${finalCheck}`,
-            criteria: {
-              true: "Every part of the intended end state is visibly in place",
-              false: "Some part of it is missing, or was undone"
-            }
-          }
-        }
+        jevQuestions
       );
       ctx.jevMs += Date.now() - t;
-      const p = answers.verified?.noul ?? 0;
-      trace.step({ i: ++ctx.decisionNo, final_check: finalCheck, verified: p, url: ctx.obs?.url });
-      if (p <= 0.5) {
+      if (askQuestions) {
+        answers = {};
+        for (const q of askQuestions) answers[q.key] = compactAnswer(got[q.key]);
+      }
+      const p = got.verified?.noul ?? 0;
+      trace.step({ i: ++ctx.decisionNo, final_check: checkEnd, verified: checkEnd ? p : null, answers, url: ctx.obs?.url });
+      if (checkEnd && p <= 0.5) {
         status = "needs_help";
-        reason = `Every subgoal finished, but the final check did not hold (p=${p.toFixed(2)}): ${finalCheck}. Something set earlier was probably undone by a later step — inspect the page before treating this as done.`;
+        reason = `Every subgoal finished, but the final check did not hold (p=${p.toFixed(2)}): ${checkEnd}. Something set earlier was probably undone by a later step — inspect the page before treating this as done.`;
       }
     } catch (err) {
-      status = "needs_help";
-      reason = `Every subgoal finished, but the final check could not be run: ${err?.message ?? err}`;
+      if (checkEnd) {
+        status = "needs_help";
+        reason = `Every subgoal finished, but the final check could not be run: ${err?.message ?? err}`;
+      } else {
+        reason = `${reason ? `${reason} ` : ""}The questions could not be answered: ${err?.message ?? err}`;
+      }
     }
   }
 

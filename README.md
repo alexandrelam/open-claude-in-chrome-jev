@@ -536,6 +536,34 @@ jev_navigate({
 })
 ```
 
+A whole test can be one call. `fill_defaults: true` lets Jev pick the first
+real option for any choice field (select, combobox, radio, checkbox) you gave no
+value for. It never makes up text. `questions` are asked about the page the run
+ends on, in the same request as `final_check`, and come back under `answers`:
+
+```
+jev_navigate({
+  tabId: 12345,
+  start_url: "http://localhost:3010/admin/system-encounter-profiles",
+  values: { name: "Cache fix test template" },
+  fill_defaults: true,
+  allow_sensitive: true,
+  subgoals: [
+    { goal: "open a new template", success_criteria: "newEncounterProfile=true in the URL" },
+    { goal: "fill the form and save it", success_criteria: "the template appears in the list" },
+    { goal: "via the sidebar, open Settings, then Templates, then the new template", success_criteria: "its settings page is open" }
+  ],
+  questions: [{ key: "disabled", type: "yes_no", question: "Is 'Enable this template' switched off?" }]
+})
+```
+
+When a leg stops, the result says what is in the way, when the page shows it.
+`blockers` lists the disabled control the leg names (a greyed-out Save, say)
+and the fields that look empty. `remaining_subgoals` holds the legs that never
+ran, verbatim, so the next call is the fix-up legs followed by those.
+`page_excerpt.interactive` lists the page's controls by real `ref`, with
+disabled ones marked, so a step taken by hand can click by ref.
+
 **`jev_decide`** does the same observation and decision but performs no action,
 returning the proposal and the full probability distribution. Use it when trying
 the loop on a new site.
