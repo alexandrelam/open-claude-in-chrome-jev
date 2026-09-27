@@ -1,4 +1,7 @@
 node_modules/
+
+# compiled extension (npm run build)
+extension/dist/
 host/native-host-wrapper.sh
 host/native-host-wrapper.bat
 host/com.anthropic.open_claude_in_chrome.json

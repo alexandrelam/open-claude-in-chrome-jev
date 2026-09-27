@@ -1,0 +1,61 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "promise", "node"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "rules": {
+    // Stricter than the categories: no `any`, in any form, and no `!`.
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/no-unsafe-argument": "error",
+    "typescript/no-unsafe-assignment": "error",
+    "typescript/no-unsafe-call": "error",
+    "typescript/no-unsafe-member-access": "error",
+    "typescript/no-unsafe-return": "error",
+    "typescript/switch-exhaustiveness-check": ["error", { "considerDefaultExhaustiveForUnions": true }],
+    "eqeqeq": ["error", "always", { "null": "ignore" }],
+
+    // `__ocic` and `__ocic_offscreen` are keys of the messages the extension's
+    // contexts exchange; renaming them would break a running recording.
+    "no-underscore-dangle": "off",
+    // chrome.runtime.Port#postMessage, not window.postMessage: there is no origin.
+    "unicorn/require-post-message-target-origin": "off",
+    // IndexedDB requests and Image are driven through their on* handlers
+    // throughout; that is the idiom those APIs document.
+    "unicorn/prefer-add-event-listener": "off",
+    // Sorting an array this code just built, in place, is intended.
+    "unicorn/no-array-sort": "off",
+    // Helpers are kept next to the one function that uses them.
+    "unicorn/consistent-function-scoping": "off",
+    // chrome.runtime.onMessage answers through sendResponse from inside a
+    // .then(), and side-effect-only .then() callbacks return nothing.
+    "promise/always-return": "off",
+    "promise/no-callback-in-promise": "off",
+    // Casts are how data crossing a process or extension boundary (JSON,
+    // runtime messages, IndexedDB rows) gets its declared type; each one is
+    // at that boundary.
+    "typescript/no-unsafe-type-assertion": "off"
+  },
+  "overrides": [
+    {
+      "files": ["host/test/**", "test/**", "host/codemode/test-*.ts"],
+      "rules": {
+        // Tests assert on fixtures they just built.
+        "typescript/no-non-null-assertion": "off",
+        // The extraction harness compiles shipped source with new Function.
+        "typescript/no-implied-eval": "off"
+      }
+    }
+  ],
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/node_modules/**",
+    "extension/vendor/**",
+    "benchmark/**",
+    "REAL/**",
+    "scratch/**",
+    "docs/**"
+  ]
+}

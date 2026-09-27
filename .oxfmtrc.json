@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 120,
+  "ignorePatterns": [
+    "**/dist/**",
+    "extension/vendor/**",
+    "benchmark/**",
+    "REAL/**",
+    "scratch/**",
+    "docs/**",
+    "**/*.md",
+    "**/*.html",
+    "**/*.css",
+    "**/package-lock.json"
+  ]
+}
