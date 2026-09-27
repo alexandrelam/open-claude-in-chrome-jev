@@ -19,7 +19,7 @@ Start with `tabs_context_mcp`, then `tabs_create_mcp`: work in a new tab and nev
 
 - Every leg of the task goes in `subgoals`, all text in `values`, and `start_url` for where to begin. For legs you can't see yet, describe the outcome ("fill the form and save it"), not field names you'd be guessing.
 - `success_criteria` names **where you are**, not page content: "the revision history is open", not "a list of revisions is shown". State that lives in the URL goes as key=value (`tab=billing in the URL`), which is checked exactly.
-- Verification goes in `questions` (answered on the final page), not screenshots. Add `final_check` when a later leg could undo an earlier one.
+- Verification goes in `questions` (see Questions below), not screenshots. Add `final_check` when a later leg could undo an earlier one.
 - `fill_defaults: true` only when any option will do (test data). `allow_sensitive: true` only when the user asked for that save, send, pay or delete.
 - When it hands back, stay in Jev:
 
@@ -29,6 +29,32 @@ Start with `tabs_context_mcp`, then `tabs_create_mcp`: work in a new tab and nev
 | `needs_value` | add the missing text to `values`, same call again |
 | `limit_reached` | raise `max_ms` / `max_steps`, or split the task |
 | `partial` | done; the optional legs listed in `reason` were skipped |
+
+## Questions: how Jev judges
+
+You write a set of questions once; Jev answers **every question for every page** in one request per page. It never replies in prose: each answer is a probability over the options you defined.
+
+```js
+questions: [
+  { key: "real_laptop", type: "yes_no", question: "Is this ad selling a complete, working laptop?",
+    yes: "a laptop for sale", no: "a part, accessory, broken unit or a wanted ad" },
+  { key: "condition", type: "choice", question: "What condition does the seller describe?",
+    options: { like_new: "new or like new", good: "used, works fine", worn: "visible wear or a flaw", faulty: "a defect" } },
+  { key: "deal", type: "score", question: "How good is the price against the reference prices in context?",
+    scale: ["Overpriced", "Fair", "Good", "Great"] },
+]
+```
+
+Answers come back per page, each with `evidence`, the passage it rests on quoted verbatim:
+
+```js
+{ real_laptop: { yes: 0.97, evidence: "Vends mon Dell XPS 15…" },
+  condition:   { choice: "good", p: 0.71, runner_up: { choice: "worn", p: 0.22 }, evidence: "…" },
+  deal:        { score: 2.4, label: "Good", confidence: 0.8, evidence: "…" } }
+```
+
+- In **jev_assess** the questions are asked of every item; you get one row per item plus a `summary` per question (yes/no counts, counts per choice, mean score).
+- In **jev_navigate** they are asked once, of the page the run ends on, and come back under `answers`. Use them to verify the task ("is the Enable switch now off?") instead of a screenshot.
 
 ## Judging many items: jev_assess
 
@@ -69,7 +95,7 @@ items.filter(Boolean);
 - **Every question in the first pass.** A second call on the same items redoes all the work. Include the ones whose `evidence` you'll want later: "does the ad name the nearest station?" as a yes_no returns the sentence that names it.
 - Put what a page can't know in `context`: today's reference prices (look them up on the web first; don't trust your own price memory), the user's criteria, what counts as good. Facts about one item go in that item's `context`.
 - **Rank with a `score`, not a strict yes_no.** A yes_no "is this a good deal?" with a tight rule can leave 1 of 86 items; a `score` scale such as Overpriced / Fair / Good / Great lets you read the top of the list and decide the cutoff yourself.
-- State each question fully (Jev sees nothing else of your intent), one fact per question, and for yes_no say what counts as yes and no. Keys are short identifiers.
+- State each question fully (Jev sees nothing else of your intent), one fact per question, and for yes_no say what counts as yes and no. A `choice` needs at least 2 `options`, a `score` an ordered `scale`. Keys are short identifiers, not `verified`, `model`, `usage` or `id`.
 - On long lists pass `where` (e.g. `[{key: "relevant", yes_above: 0.5}]`) to get back only the matching rows. The summary still counts everything.
 
 ### Read the answers
