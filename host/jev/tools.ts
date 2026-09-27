@@ -133,7 +133,7 @@ const ASSESS_SHAPE = {
     .string()
     .optional()
     .describe(
-      "JavaScript run in `tabId` (top-level await allowed) whose last expression is an array of items shaped like `items` (e.g. [{url, label, context}] built from the page's data). They are appended to `items`, so extracting the list and judging it takes one call instead of two.",
+      "JavaScript run in `tabId` (top-level await allowed) whose last expression is an array of items shaped like `items` (e.g. [{url, label, context}] built from the page's data). They are appended to `items`, so extracting the list and judging it takes one call instead of two. The script runs with the user's session, so it can also `fetch()` further result pages and each item's page and return their content as `text` items: those are judged in parallel without opening anything, far faster than `url` items, which are opened one by one.",
     ),
   items_script_url: z
     .string()

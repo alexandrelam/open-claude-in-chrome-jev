@@ -28,6 +28,7 @@ import { resolveConfig, configError } from "./jev/config.ts";
 import { createClient } from "./jev/client.ts";
 import { navigate, decideOnce } from "./jev/navigator.ts";
 import { assess } from "./jev/assess.ts";
+import { INSTRUCTIONS } from "./jev/instructions.ts";
 import type { AssessArgs, DecideArgs, NavigateArgs } from "./jev/tools.ts";
 import { errorMessage } from "./errors.ts";
 
@@ -56,42 +57,6 @@ await init();
 const cfg = resolveConfig();
 const cfgError = configError(cfg);
 if (cfgError) process.stderr.write(`[jev] ${cfgError}\n`);
-
-// Sent once at connect, ahead of any tool description. The audited session
-// that prompted this made one jev_navigate call and about forty ordinary ones:
-// when Jev handed back, Claude finished the form and the verification by hand,
-// although the tool description said to call again. Stated here, up front.
-const INSTRUCTIONS = `This server drives the user's real Chrome. Besides the ordinary browser tools it has Jev, a fast, cheap decision model: it picks each next click or keystroke, and answers your questions with probabilities. It never writes text and never invents a value, so the split is: you plan, supply every piece of text, and state your rules; Jev does the mechanical clicking and the per-page judging. Each of your turns costs far more time than a Jev run, so put as much as you can into each call.
-
-Start with tabs_context_mcp (and tabs_create_mcp for a fresh tab) to get a tabId.
-
-## Doing things: jev_navigate
-- Plan the whole task as ONE call. Put every navigation and form leg in \`subgoals\`, every piece of text to type in \`values\`, and \`start_url\` for where to begin. Set \`fill_defaults: true\` when any option will do for a form's choice fields (test data), and \`allow_sensitive: true\` when the task includes a save, submit, send or delete the user asked for. Put the verification you would otherwise do with screenshots in \`questions\` (see below). Add \`final_check\` when a later leg could undo an earlier one.
-- Legs you can't see yet: describe the outcome ("fill the form and save it") rather than guessing at field names. Jev reads the page.
-- Success criteria: name where you are, not page content. When the app puts state in the URL, write it as key=value ("newEncounterProfile=true in the URL"), which is checked exactly.
-- When it hands back, stay in Jev:
-  - needs_help / blocked: read \`reason\` and \`blockers\` (e.g. Save is disabled, and these fields are empty). Call again with fix-up legs followed by \`remaining_subgoals\`.
-  - needs_value: add the missing text to \`values\`, then call again.
-  - limit_reached: raise \`max_ms\`/\`max_steps\`, or split the task.
-  - partial: the optional legs listed in \`reason\` were skipped.
-- Only take a step yourself when Jev truly can't, and do it by \`ref\` from \`page_excerpt.interactive\`, never by screenshot coordinates. Then go back to jev_navigate.
-
-## Judging things: questions and jev_assess
-You can hand Jev your judgement as questions. It answers each one with a probability over the options you defined, never with prose.
-- On one page, after acting: \`questions\` on jev_navigate, answered on the page the run ends on, under \`answers\`. E.g. {key: "disabled", type: "yes_no", question: "Is the 'Enable this template' switch off?"}.
-- On many items: jev_assess. Use it whenever you would otherwise open or read items one by one to compare or filter them: listings, search results, profiles, table rows, candidates. Each item is a \`url\` to open, \`text\` you already hold, or a \`goal\` to navigate first (the jev_navigate loop), and every question is asked of every item. You get a summary per question, plus one row per item with its answers. Each answer carries \`evidence\`, the passage of the page it rests on, quoted verbatim.
-- When the items come from a page (the ads on a results page, the sellers behind them), don't extract them first: pass \`items_script\`, a script whose last expression is the array of items, and extraction and judging happen in one call. Give \`items_script_url\` (the listing) so a second call doesn't run the script on the last item's page.
-- There is no item limit, so judge the whole list in one call. On a long list, pass \`where\` (e.g. [{key: "available", yes_above: 0.5}]) to get back only the rows that match. The summary still counts everything.
-- Put what a page can't know in \`context\`: today's reference price, the user's criteria, what counts as good. Jev applies it to every item. Facts about one item go in that item's \`context\`.
-- Writing questions: types are yes_no, choice (at least 2 \`options\`) and score (an ordered \`scale\`). Jev sees nothing of your intent beyond the question, so state it fully, ask one fact per question, and for yes_no say what counts as yes and no in \`yes\`/\`no\`. Keys are short identifiers (not "verified", "model", "usage" or "id").
-- Ask everything in the first pass. All questions about an item go to Jev in one request, so a second call on the same pages costs a full re-visit. Include the questions whose evidence you will need later: "which metro station is nearest?" as a yes_no returns the sentence that names it.
-- Judge the page that holds the answer. When an aggregator truncates the text and links to the source, resolve the source URLs inside \`items_script\` and assess those pages directly. Hidden text is already read, so don't add a \`goal\` just to expand a collapsed panel.
-- Reading answers: a yes_no answer near 0.5, or a choice with a close \`runner_up\`, is doubt. Read its \`evidence\` first; open the page yourself only when the quote does not settle it.
-- Questions can't write text, but \`evidence\` quotes it: a street, a station, a clause. For an exact value you must reuse elsewhere (an ID, a URL), read it with get_page_text or read_page.
-
-## Other tools
-- jev_decide: asks what Jev would do next, without doing it. Use it to sanity-check a new site before a long run.
-- computer, find, read_page, form_input and the rest are for single steps. Prefer \`ref\` over coordinates. Screenshot coordinates are in the image's own pixels.`;
 
 const server = new McpServer(
   {
