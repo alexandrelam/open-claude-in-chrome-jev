@@ -24,6 +24,7 @@ import {
 import { shortlistRows, renderRow } from "./shortlist.ts";
 import { termsFrom, lexicalScore, prefilter } from "./relevance.ts";
 import { buildQuestions, questionsError, compactAnswer } from "./questions.ts";
+import { EVIDENCE_SUFFIX, splitPassages, numberedText, evidenceQuestions, pickEvidence } from "./evidence.ts";
 import { MAX_CHOICES } from "./config.ts";
 import { createTrace } from "./trace.ts";
 import { BudgetExceeded } from "./client.ts";
@@ -54,6 +55,8 @@ export interface Subgoal {
   values: Record<string, string>;
   optional?: boolean | null;
   fillDefaults: boolean;
+  /** Asked of the page this leg ends on, once it is done. */
+  questions?: ClaudeQuestion[] | null;
 }
 
 /** A leg as a caller may write it: the tool's snake_case, or camelCase. */
@@ -187,6 +190,10 @@ interface LegSummary {
   blockers?: Blockers;
   recovered?: string[];
   skipped?: true;
+  /** Answers to this leg's own questions, about the page it ended on. */
+  answers?: Record<string, CompactAnswer | null>;
+  /** Set when the answers describe a page the leg did not finish on. */
+  answers_note?: string;
 }
 
 /** What jev_navigate returns. */
@@ -198,6 +205,8 @@ export interface NavigateResult {
   final_url?: string;
   final_title?: string;
   answers?: Record<string, CompactAnswer | null>;
+  /** Set when `answers` describe the page where a leg stopped the run. */
+  answers_note?: string;
   blockers?: Blockers;
   remaining_subgoals?: SubgoalInput[];
   page_excerpt?: { url: string; title: string; text: string; interactive: string[] } | null;
@@ -232,10 +241,37 @@ type ObserveOutcome = { obs: Observation; failure: null } | { obs: Observation |
 
 const NONE = "NONE";
 
+// How sure Jev must be to type a value into a field whose name shares no word
+// with the value's label. An optional leg asked to type into a comment box, on
+// a page without one, typed into an unrelated field at 0.65, which passed the
+// ordinary gate.
+const MISMATCH_CONFIDENCE = 0.85;
+
+/**
+ * Does the field look like the one the value's label names? True when a word
+ * of the label appears in the field's name or section, or when there is
+ * nothing to compare (a short key like "q", an unnamed field).
+ */
+export function valueFitsField(key: string, row: Row | null | undefined): boolean {
+  const label = `${row?.name ?? ""} ${row?.section ?? ""}`;
+  // Whole words, not substrings: "add" from "Add a comment" is not in
+  // "Shipping address". Hyphens are also read joined, so "E-mail" is "email".
+  const words = termsFrom(label, label.replace(/[-_.]/g, ""));
+  const terms = [...termsFrom(key, key.replace(/[-_.]/g, ""))];
+  if (!terms.length || !words.size) return true;
+  // Or a shared five-letter stem, so "settings" meets "setting".
+  const stem = (w: string) => (w.length >= 5 ? w.slice(0, 5) : w);
+  const stems = new Set([...words].map(stem));
+  return terms.some((t) => words.has(t) || (t.length >= 5 && stems.has(stem(t))));
+}
+
 // How many times one subgoal may recover from a failure on its own before it
 // hands back. Each recovery is a fresh look at the page and a fresh decision,
 // so this bounds the extra Jev requests a flaky page can cost.
 const MAX_RECOVERIES = 2;
+
+// The longest one WAIT holds for the page to change before Jev looks again.
+const WAIT_MS = 5000;
 
 /**
  * Will activating this href replace the document?
@@ -379,7 +415,7 @@ export function buildRequest(
     values: valueKeys,
   };
   // What this leg already did. Without it every decision is made from scratch,
-  // and on the audited admin page Jev clicked "New template" three times in a
+  // and on the audited admin page Jev clicked "New product" three times in a
   // row because each look at the open form still read as "not open yet".
   if (history.length) state.history = history;
   if (fillDefaults) state.defaults = DEFAULTS_NOTE;
@@ -537,6 +573,22 @@ export function validate(
   let row: Row | null = null;
   let confidence = opAns.confidence ?? 0;
 
+  // Unsure whether the page is finished or still coming in: wait and look
+  // again. Waiting touches nothing, so doubt about it is no reason to hand
+  // back. The first real run stopped after 5 s of a 240 s budget, with WAIT
+  // at 0.62 against DONE at 0.38, while a report was still being built.
+  if ((operation === "WAIT" || operation === "DONE") && confidence < cfg.minConfidence) {
+    return {
+      ok: true,
+      operation: "WAIT",
+      row: null,
+      value: undefined,
+      confidence,
+      sensitive: false,
+      demotedFrom: operation === "DONE" ? "DONE" : null,
+    };
+  }
+
   if (spec.needsTarget) {
     const head = targetHead(operation);
     const targetAns = head ? answers[head] : undefined;
@@ -589,7 +641,7 @@ export function validate(
       operation,
       row,
       confidence,
-      reason: `Confidence ${confidence.toFixed(2)} is below the ${cfg.minConfidence} threshold for ${operation} on ${rowLabel(row)}.`,
+      reason: `Confidence ${confidence.toFixed(2)} is below the ${cfg.minConfidence} threshold for ${operation}${row ? ` on ${rowLabel(row)}` : ""}.`,
     };
   }
 
@@ -637,6 +689,16 @@ export function validate(
         row,
         confidence,
         reason: `${operation} needs a value for ${rowLabel(row)} (role ${row?.role || "unknown"}${row?.type ? `, type ${row.type}` : ""}), and none of the provided values fits. Supply one in \`values\` and call again.`,
+      };
+    }
+    if (key !== undefined && !valueFitsField(key, row) && confidence < MISMATCH_CONFIDENCE) {
+      return {
+        ok: false,
+        status: "needs_help",
+        operation,
+        row,
+        confidence,
+        reason: `The value for "${key}" does not look like it belongs in ${rowLabel(row)}, and Jev was only ${confidence.toFixed(2)} sure (${MISMATCH_CONFIDENCE} needed when the names do not match). The field "${key}" may not be on this page.`,
       };
     }
     value = provided;
@@ -748,6 +810,7 @@ export function normalizeSubgoals(args: Omit<NavigateInput, "tabId">): Subgoal[]
       values: sg.values ?? args.values ?? {},
       optional: sg.optional ?? null,
       fillDefaults: sg.fill_defaults ?? args.fill_defaults ?? false,
+      questions: Array.isArray(sg.questions) && sg.questions.length ? sg.questions : null,
     }));
   }
   return [
@@ -788,8 +851,8 @@ const brief = (r: Row): BriefRow => ({
  * names, and the empty fields around them.
  *
  * The audited run stopped with "Confidence 0.52 is below the 0.6 threshold for
- * CLICK on button New template" while the real story was on screen: Save was
- * disabled because Visit type and Format were empty. Claude had to take a
+ * CLICK on button New product" while the real story was on screen: Save was
+ * disabled because Category and Format were empty. Claude had to take a
  * screenshot to learn that, then finished the form by hand. Said in the
  * reason, it is a one-call fix: add legs for the fields, then retry.
  *
@@ -1045,7 +1108,9 @@ async function runSubgoal(
     const actionKey = `${observationSignature(obs)}|${verdict.operation}:${verdict.row?.ref ?? "-"}:${verdict.value ?? ""}`;
     const count = (actionCounts.get(actionKey) ?? 0) + 1;
     actionCounts.set(actionKey, count);
-    if (count > 2) {
+    // Waiting on a page that has not changed yet is not a loop; the step cap
+    // and max_ms bound it.
+    if (count > 2 && verdict.operation !== "WAIT") {
       return stop(
         "needs_help",
         `The same action (${verdict.operation} on ${rowLabel(verdict.row)}) came up three times without progress.`,
@@ -1062,9 +1127,15 @@ async function runSubgoal(
     // sits in between — so a ref failure re-observes and retries the same
     // operation once against the row that now carries that label.
     const actStart = Date.now();
+    // A WAIT never outlasts the call's own budget: leave a second for the
+    // decision that follows it.
+    const waitMs = Math.max(250, Math.min(WAIT_MS, ctx.deadline - Date.now() - 1000));
     let acted = await runCalls(
       callTool,
-      planToolCalls(verdict.operation, verdict.row, verdict.value, tabId, { jevTools: hasJevTools(callTool) }),
+      planToolCalls(verdict.operation, verdict.row, verdict.value, tabId, {
+        jevTools: hasJevTools(callTool),
+        waitMs,
+      }),
     );
     // A covered target is not stale: re-finding it by name returns the same
     // covered element, so it goes straight back as the failure it is.
@@ -1080,7 +1151,7 @@ async function runSubgoal(
       if (again) {
         acted = await runCalls(
           callTool,
-          planToolCalls(verdict.operation, again, verdict.value, tabId, { jevTools: hasJevTools(callTool) }),
+          planToolCalls(verdict.operation, again, verdict.value, tabId, { jevTools: hasJevTools(callTool), waitMs }),
         );
       }
     }
@@ -1108,6 +1179,23 @@ async function runSubgoal(
       ...(verdict.defaulted ? { defaulted_value: verdict.value } : {}),
       ms: Date.now() - stepStart,
     });
+
+    // A WAIT already waited for the page to move. Whether it did is not
+    // progress or its absence: the next decision looks again, and the
+    // unchanged-page check below would end a leg that is only waiting.
+    if (verdict.operation === "WAIT") {
+      const waited = await observeNow();
+      if (waited.failure) {
+        if (waited.obs) ctx.obs = waited.obs;
+        return stop(waited.failure.status, waited.failure.reason, { fatal: true });
+      }
+      const sig = observationSignature(waited.obs);
+      if (sig !== observationSignature(obs)) unchangedStreak = 0;
+      lastSignature = sig;
+      ctx.obs = waited.obs;
+      history.push({ operation: "WAIT", target: "", page_changed: sig !== observationSignature(obs) });
+      continue;
+    }
 
     // Observe once, and keep it: it is both this step's did-anything-move check
     // and the next step's starting observation.
@@ -1272,6 +1360,95 @@ export function handbackRows(
     .map(({ r }) => renderRow(r, r.ref));
 }
 
+// How much page text questions are asked of. A step decides on 300 characters
+// of what is in view, because more prose dilutes an ACTION decision; questions
+// are about the page's content, which is often longer and below the fold.
+const ANSWER_TEXT_CHARS = 6000;
+// How much of that text comes back to Claude in page_excerpt.
+const EXCERPT_RETURN_CHARS = 1500;
+
+/**
+ * Ask Claude's questions, and a final check, about the page as it is now, in
+ * one request. The page is read whole and cut into numbered passages, so each
+ * answer comes back with the passage it rests on, quoted verbatim, as
+ * jev_assess does. Throws when the page cannot be read or Jev cannot answer.
+ */
+async function answerOnPage(
+  callTool: CallTool,
+  client: JevClient,
+  cfg: JevConfig,
+  ctx: RunContext,
+  trace: Trace,
+  tabId: number,
+  { questions, finalCheck, leg }: { questions: ClaudeQuestion[] | null; finalCheck: string | null; leg?: number },
+): Promise<{ answers: Record<string, CompactAnswer | null> | null; verified: number | null; obs: Observation }> {
+  const t = Date.now();
+  const { obs, failure } = await observeOrFail(callTool, tabId, cfg, {
+    excerptChars: ANSWER_TEXT_CHARS,
+    fullText: true,
+  });
+  ctx.browserMs += Date.now() - t;
+  if (!obs || failure) throw new Error(failure?.reason ?? "the page could not be read");
+
+  const passages = questions ? splitPassages(obs.excerpt) : [];
+  const jevQuestions: JevQuestions = {};
+  if (questions) {
+    Object.assign(jevQuestions, buildQuestions(questions));
+    if (passages.length) Object.assign(jevQuestions, evidenceQuestions(questions, passages.length));
+  }
+  if (finalCheck) {
+    jevQuestions["verified"] = {
+      type: "noul",
+      instructions: `Is ALL of this true of the page right now: ${finalCheck}`,
+      criteria: {
+        true: "Every part of the intended end state is visibly in place",
+        false: "Some part of it is missing, or was undone",
+      },
+    };
+  }
+  // The rows the questions name, when the page has more than fit.
+  const rows = prefilter(obs.rows, {
+    goal: [finalCheck, ...(questions ?? []).map((q) => q.question)].filter(Boolean).join(" "),
+    limit: cfg.maxRows,
+    pageUrl: obs.url,
+  }).rows;
+  const t2 = Date.now();
+  const { answers: got } = await client.decide(
+    {
+      ...(finalCheck ? { intended_end_state: finalCheck } : {}),
+      url: obs.url,
+      title: obs.title,
+      page_text: passages.length ? numberedText(passages) : obs.excerpt,
+      elements: rows.map((r, k) => renderRow(r, `e${k + 1}`)),
+    },
+    jevQuestions,
+  );
+  ctx.jevMs += Date.now() - t2;
+
+  let answers: Record<string, CompactAnswer | null> | null = null;
+  if (questions) {
+    answers = {};
+    for (const q of questions) {
+      const answer = compactAnswer(got[q.key]);
+      if (answer && passages.length) {
+        const quote = pickEvidence(got[q.key + EVIDENCE_SUFFIX], passages);
+        if (quote) answer.evidence = quote;
+      }
+      answers[q.key] = answer;
+    }
+  }
+  const verified = finalCheck ? (got["verified"]?.noul ?? 0) : null;
+  trace.step({
+    i: ++ctx.decisionNo,
+    ...(leg ? { leg } : {}),
+    final_check: finalCheck,
+    verified,
+    answers,
+    url: obs.url,
+  });
+  return { answers, verified, obs };
+}
+
 /** The full loop over one or more subgoals. Backs the jev_navigate tool. */
 export async function navigate(
   callTool: CallTool,
@@ -1281,18 +1458,30 @@ export async function navigate(
 ): Promise<NavigateResult> {
   const { tabId, values = {}, start_url: startUrl, allow_sensitive: allowSensitive = false } = args;
   const questions = Array.isArray(args.questions) && args.questions.length ? args.questions : null;
+  const finalCheck = args.final_check ?? args.finalCheck ?? null;
+  // No goal and no legs: only answer the questions about the page as it is.
+  // It used to take a "stay on this page; do nothing" leg to get there.
+  const questionsOnly = !args.goal && !(Array.isArray(args.subgoals) && args.subgoals.length);
+  if (questionsOnly && !questions && !finalCheck) {
+    return { status: "error", reason: "Nothing to do: give a goal, subgoals, or questions about the current page." };
+  }
 
   // Refused before anything is opened or clicked, as jev_assess does.
+  const questionsProblem = (list: ClaudeQuestion[]) =>
+    questionsError(list) ??
+    (list.some((q) => q.key === "verified")
+      ? 'Question key "verified" is reserved for final_check; use another name.'
+      : null);
   if (questions) {
-    const qErr =
-      questionsError(questions) ??
-      (questions.some((q) => q.key === "verified")
-        ? 'Question key "verified" is reserved for final_check; use another name.'
-        : null);
+    const qErr = questionsProblem(questions);
     if (qErr) return { status: "error", reason: qErr };
   }
 
-  const subgoals = normalizeSubgoals(args);
+  const subgoals = questionsOnly ? [] : normalizeSubgoals(args);
+  for (const [idx, sub] of subgoals.entries()) {
+    const qErr = sub.questions ? questionsProblem(sub.questions) : null;
+    if (qErr) return { status: "error", reason: `Subgoal ${idx + 1}: ${qErr}` };
+  }
   // max_steps bounds each subgoal so one runaway leg cannot eat the whole call;
   // max_ms and the spend cap bound the call as a whole.
   const maxSteps = Math.min(args.max_steps ?? cfg.maxSteps, cfg.maxSteps);
@@ -1301,7 +1490,7 @@ export async function navigate(
   const runCfg = { ...cfg, minConfidence };
 
   const trace = createTrace(cfg.tracesDir, {
-    goal: subgoals.map((s) => s.goal).join(" → "),
+    goal: questionsOnly ? "(questions only)" : subgoals.map((s) => s.goal).join(" → "),
     subgoals: subgoals.map((s) => ({ goal: s.goal, success_criteria: s.successCriteria })),
     tab_id: tabId,
     model: cfg.model,
@@ -1332,6 +1521,7 @@ export async function navigate(
   let remaining: SubgoalInput[] | null = null;
   let stoppedLeg: Subgoal | null = null;
   let answers: Record<string, CompactAnswer | null> | null = null;
+  let answersNote: string | null = null;
 
   const finish = (): NavigateResult => {
     const obs = ctx.obs;
@@ -1362,13 +1552,14 @@ export async function navigate(
       // The final page, so Claude can carry on without spending a turn on
       // read_page just to find out where the loop left the tab.
       ...(answers ? { answers } : {}),
+      ...(answers && answersNote ? { answers_note: answersNote } : {}),
       ...(blockers ? { blockers } : {}),
       ...(remaining ? { remaining_subgoals: remaining } : {}),
       page_excerpt: obs
         ? {
             url: obs.url,
             title: obs.title,
-            text: obs.excerpt,
+            text: obs.excerpt.slice(0, EXCERPT_RETURN_CHARS),
             // Rendered by ref, not e-id: these are what Claude acts on if it
             // has to take a step itself. More of them when it will.
             interactive: handbackRows(obs, stoppedLeg, status === "done" ? 40 : 80),
@@ -1401,7 +1592,6 @@ export async function navigate(
     ctx.settleMs += Date.now() - t;
   }
 
-  const finalCheck = args.final_check ?? args.finalCheck ?? null;
   const continueOnFailure = Boolean(args.continue_on_failure ?? args.continueOnFailure);
 
   let carry: Carry | null = null;
@@ -1421,7 +1611,7 @@ export async function navigate(
     // leg starts from wherever this one left the page. Running out of time or
     // budget, or losing the page, stops every leg alike, so those never skip.
     const skip = leg.status !== "done" && !leg.fatal && (sub.optional ?? continueOnFailure);
-    legs.push({
+    const summary: LegSummary = {
       i: idx + 1,
       goal: sub.goal,
       status: leg.status,
@@ -1430,8 +1620,28 @@ export async function navigate(
       ...(leg.blockers ? { blockers: leg.blockers } : {}),
       ...(leg.recovered?.length ? { recovered: leg.recovered } : {}),
       ...(skip ? { skipped: true } : {}),
-    });
+    };
+    legs.push(summary);
     allSteps.push(...leg.steps);
+    // The leg's own checks, on the page it ended on. A test plan is a run of
+    // "do this, then check that", and with checks only at the end of a run
+    // every check cost a call of its own: ten calls for one plan in the run
+    // that motivated this. Not asked of a skipped leg, whose page is whatever
+    // an earlier leg left. The step observation is kept, not replaced, so the
+    // next leg's carried decision still applies.
+    if (sub.questions && !skip) {
+      try {
+        const got = await answerOnPage(callTool, client, runCfg, ctx, trace, tabId, {
+          questions: sub.questions,
+          finalCheck: null,
+          leg: idx + 1,
+        });
+        if (got.answers) summary.answers = got.answers;
+        if (leg.status !== "done") summary.answers_note = "Answered about the page where this leg stopped.";
+      } catch (err) {
+        summary.reason = `${summary.reason ? `${summary.reason} ` : ""}Its questions could not be answered: ${errorMessage(err)}`;
+      }
+    }
     status = leg.status;
     reason = leg.reason;
     if (skip) {
@@ -1475,74 +1685,32 @@ export async function navigate(
   // Every leg reported done — but a per-leg check only ever asked "is THIS leg
   // finished", on the page as it stood at the time. It cannot notice a setting
   // from leg 2 being silently reset by leg 7, which is exactly what the audited
-  // app does: turning on "Split by problem" resets the section style a previous
+  // app does: turning on "Group by week" resets the chart style a previous
   // leg had just set. One question against the whole intended end state is the
   // only thing that catches it.
   //
   // Claude's own questions ride in the same request. They are how a task ends
   // in verification without Claude reading the page: "is the Enable switch
-  // off?" was thirteen manual calls in the audited run. Asked only when the
-  // run got where it was going; on a page a leg stopped at, the answers would
-  // describe the wrong place.
-  // final_check only judges a run that claims to be done; questions are
-  // answered on a partial run too, since skipped legs were optional ones.
+  // off?" was thirteen manual calls in the audited run. final_check only
+  // judges a run that claims to be done. The questions are answered whatever
+  // the outcome, marked when the page is where a leg stopped: withholding them
+  // cost a second call ("stay on this page; do nothing") just to ask them.
   const checkEnd = status === "done" ? finalCheck : null;
-  const askQuestions = status === "done" || status === "partial" ? questions : null;
-  if (checkEnd || askQuestions) {
-    const { obs: finalObs } = await (async () => {
-      const t = Date.now();
-      // A wider excerpt than a step gets. The 300-char cap exists because more
-      // prose dilutes an ACTION decision; these questions are about the page's
-      // content, which the controls alone often do not show.
-      const r = await observeOrFail(callTool, tabId, runCfg, { excerptChars: 1500 });
-      ctx.browserMs += Date.now() - t;
-      return r;
-    })();
-    if (finalObs) ctx.obs = finalObs;
-    const jevQuestions: JevQuestions = {};
-    if (askQuestions) Object.assign(jevQuestions, buildQuestions(askQuestions));
-    if (checkEnd) {
-      jevQuestions["verified"] = {
-        type: "noul",
-        instructions: `Is ALL of this true of the page right now: ${checkEnd}`,
-        criteria: {
-          true: "Every part of the intended end state is visibly in place",
-          false: "Some part of it is missing, or was undone",
-        },
-      };
-    }
-    // The rows the questions name, when the page has more than fit.
-    const rows = prefilter(ctx.obs?.rows ?? [], {
-      goal: [checkEnd, ...(askQuestions ?? []).map((q) => q.question)].filter(Boolean).join(" "),
-      limit: runCfg.maxRows,
-      pageUrl: ctx.obs?.url,
-    }).rows;
+  if (checkEnd || questions) {
     try {
-      const t = Date.now();
-      const { answers: got } = await client.decide(
-        {
-          ...(checkEnd ? { intended_end_state: checkEnd } : {}),
-          url: ctx.obs?.url,
-          title: ctx.obs?.title,
-          page_excerpt: ctx.obs?.excerpt,
-          elements: rows.map((r, k) => renderRow(r, `e${k + 1}`)),
-        },
-        jevQuestions,
-      );
-      ctx.jevMs += Date.now() - t;
-      if (askQuestions) {
-        answers = {};
-        for (const q of askQuestions) answers[q.key] = compactAnswer(got[q.key]);
-      }
-      const p = got["verified"]?.noul ?? 0;
-      trace.step({
-        i: ++ctx.decisionNo,
-        final_check: checkEnd,
-        verified: checkEnd ? p : null,
-        answers,
-        url: ctx.obs?.url,
+      const got = await answerOnPage(callTool, client, runCfg, ctx, trace, tabId, {
+        questions,
+        finalCheck: checkEnd,
       });
-      if (checkEnd && p <= 0.5) {
+      ctx.obs = got.obs;
+      answers = got.answers;
+      if (status !== "done" && status !== "partial") {
+        answersNote = stoppedLeg
+          ? `Answered about the page where subgoal ${subgoals.indexOf(stoppedLeg) + 1} stopped, not the page the run was meant to reach.`
+          : "Answered about the page the run stopped on, not the page it was meant to reach.";
+      }
+      const p = got.verified;
+      if (checkEnd && p !== null && p <= 0.5) {
         status = "needs_help";
         reason = `Every subgoal finished, but the final check did not hold (p=${p.toFixed(2)}): ${checkEnd}. Something set earlier was probably undone by a later step — inspect the page before treating this as done.`;
       }

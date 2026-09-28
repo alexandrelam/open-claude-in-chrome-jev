@@ -23,7 +23,9 @@ import {
   normalizeSubgoals,
   navigatesAway,
   urlContradicts,
+  valueFitsField,
 } from "../jev/navigator.ts";
+import { isCompatible } from "../jev/actions.ts";
 import { resolveConfig } from "../jev/config.ts";
 import { errorMessage } from "../errors.ts";
 import { textOf } from "../text.ts";
@@ -704,7 +706,7 @@ await check("typing into a combobox waits for its suggestions", async () => {
   eq(settle?.args.ref, "ref_7", "for that field");
 });
 
-await check("WAIT is a quarter second, or the old second on an old extension", async () => {
+await check("WAIT waits for the page to change, or the old second on an old extension", async () => {
   for (const legacy of [false, true]) {
     const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })], legacy });
     const client = fakeClient([
@@ -714,14 +716,14 @@ await check("WAIT is a quarter second, or the old second on an old extension", a
     await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "g", success_criteria: "s" });
     const waits = browser.calls.filter(
       (c) =>
-        (c.name === "jev_settle" && c.args.expect === "wait") || (c.name === "computer" && c.args.action === "wait"),
+        (c.name === "jev_settle" && c.args.expect === "change") || (c.name === "computer" && c.args.action === "wait"),
     );
     if (legacy) eq(waits[0]?.name, "computer", "old extension: computer wait");
     else
       eq(
         `${waits[0]?.name}:${JSON.stringify(waits[0]?.args.timeoutMs)}`,
-        "jev_settle:250",
-        "current extension: jev_settle for 250 ms",
+        "jev_settle:5000",
+        "current extension: jev_settle until the page changes, up to 5 s",
       );
   }
 });
@@ -1264,7 +1266,7 @@ await check("max_steps bounds each subgoal, not the whole call", async () => {
 await check("final_check catches a setting a later step undid", async () => {
   // The failure a per-step check structurally cannot see: every leg was true
   // when it ran, and a later leg quietly reset an earlier one. The audited app
-  // does exactly this — turning on "Split by problem" resets the section style.
+  // does exactly this — turning on "Group by week" resets the chart style.
   const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Toggle" })] });
   const client = fakeClient([
     { operation: choice("CLICK", 0.95), click_target: choice("e1", 0.95), sensitive: noul(0), satisfied: noul(0.95) },
@@ -1665,23 +1667,23 @@ await check("a carried 'next leg already satisfied' the URL contradicts is not t
 
 // --- hand-backs Claude can act on, defaults, questions, history -------------
 
-// The audited admin form: Save stays disabled until Visit type and Format are
+// An audited admin form: Save stays disabled until Category and Format are
 // chosen, and the plan Claude wrote did not know that.
-const templateForm = () => [
-  row({ ref: "ref_1", role: "button", name: "New template" }),
-  row({ ref: "ref_2", role: "textbox", name: "Name", type: "text", value: "Cache fix test template" }),
-  row({ ref: "ref_3", role: "combobox", name: "Visit type", required: true }),
+const productForm = () => [
+  row({ ref: "ref_1", role: "button", name: "New product" }),
+  row({ ref: "ref_2", role: "textbox", name: "Name", type: "text", value: "Test product" }),
+  row({ ref: "ref_3", role: "combobox", name: "Category", required: true }),
   row({ ref: "ref_4", role: "combobox", name: "Format", value: "Select a format" }),
   row({ ref: "ref_5", role: "button", name: "Save", disabled: true }),
 ];
 
 await check("a disabled Save is shown to Jev but never offered as a target", async () => {
-  const browser = fakeBrowser({ rows: templateForm() });
+  const browser = fakeBrowser({ rows: productForm() });
   const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
   await navigate(browser.callTool, client, CFG, {
     tabId: 1,
     goal: "Click Save",
-    success_criteria: "the template is saved",
+    success_criteria: "the product is saved",
   });
   const { state, questions } = client.seen[0];
   assert(
@@ -1695,7 +1697,7 @@ await check("a disabled Save is shown to Jev but never offered as a target", asy
 });
 
 await check("a stuck leg names the disabled control and the empty fields, and echoes the remaining legs", async () => {
-  const browser = fakeBrowser({ rows: templateForm() });
+  const browser = fakeBrowser({ rows: productForm() });
   const client = fakeClient([
     { operation: choice("DONE", 0.9), sensitive: noul(0), satisfied: noul(0.95) },
     { operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet },
@@ -1704,18 +1706,18 @@ await check("a stuck leg names the disabled control and the empty fields, and ec
   const out = await navigate(browser.callTool, client, CFG, {
     tabId: 1,
     subgoals: [
-      { goal: "Open a new template", success_criteria: "the form is open" },
-      { goal: "Click the Save button", success_criteria: "the template is saved" },
+      { goal: "Open a new product", success_criteria: "the form is open" },
+      { goal: "Click the Save button", success_criteria: "the product is saved" },
       later,
     ],
   });
   eq(out.status, "blocked", `reason: ${out.reason}`);
   eq(out.blockers?.disabled?.[0]?.name, "Save", "the disabled control");
   const empty = (out.blockers?.empty ?? []).map((r) => r.name);
-  assert(empty.includes("Visit type") && empty.includes("Format"), `empty fields: ${empty.join(",")}`);
+  assert(empty.includes("Category") && empty.includes("Format"), `empty fields: ${empty.join(",")}`);
   assert(!empty.includes("Name"), "a filled field is not reported empty");
-  eq(empty[0], "Visit type", "required fields first");
-  assert(out.reason?.includes('"Save" is disabled') && out.reason?.includes("Visit type"), `reason: ${out.reason}`);
+  eq(empty[0], "Category", "required fields first");
+  assert(out.reason?.includes('"Save" is disabled') && out.reason?.includes("Category"), `reason: ${out.reason}`);
   eq(JSON.stringify(out.remaining_subgoals), JSON.stringify([later]), "the untouched legs, verbatim");
   const rows = out.page_excerpt!.interactive;
   assert(
@@ -1796,7 +1798,7 @@ await check("fill_defaults never makes up text", async () => {
 
 await check("questions are answered with final_check in one extra request", async () => {
   const browser = fakeBrowser({
-    rows: [row({ ref: "ref_1", role: "switch", name: "Enable this template", checked: false })],
+    rows: [row({ ref: "ref_1", role: "switch", name: "Enable this product", checked: false })],
   });
   const client = fakeClient([
     { operation: choice("DONE", 0.9), sensitive: noul(0), satisfied: noul(0.95) },
@@ -1804,10 +1806,10 @@ await check("questions are answered with final_check in one extra request", asyn
   ]);
   const out = await navigate(browser.callTool, client, CFG, {
     tabId: 1,
-    goal: "open the template",
+    goal: "open the product",
     success_criteria: "its page is open",
-    final_check: "the template page is open",
-    questions: [{ key: "disabled", type: "yes_no", question: "Is 'Enable this template' switched off?" }],
+    final_check: "the product page is open",
+    questions: [{ key: "disabled", type: "yes_no", question: "Is 'Enable this product' switched off?" }],
   });
   eq(out.status, "done", `reason: ${out.reason}`);
   eq(client.seen.length, 2, "one step, one closing request");
@@ -1820,18 +1822,24 @@ await check("questions are answered with final_check in one extra request", asyn
   );
 });
 
-await check("questions are not asked when a leg stopped the run", async () => {
+await check("questions are still answered when a leg stopped the run, and marked", async () => {
+  // Withholding them cost a second call, "stay on this page; do nothing", only
+  // to ask them.
   const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
-  const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  const client = fakeClient([
+    { operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet },
+    { ok: noul(0.9) },
+  ]);
   const out = await navigate(browser.callTool, client, CFG, {
     tabId: 1,
     goal: "g",
     success_criteria: "s",
     questions: [{ key: "ok", type: "yes_no", question: "Is it ok?" }],
   });
-  eq(out.status, "blocked", "status");
-  eq(client.seen.length, 1, "no closing request");
-  eq(out.answers, undefined, "no answers about the wrong page");
+  eq(out.status, "blocked", "status unchanged");
+  eq(client.seen.length, 2, "one closing request");
+  eq(out.answers?.ok?.yes, 0.9, "answered");
+  assert(out.answers_note?.includes("stopped"), `says which page: ${out.answers_note}`);
 });
 
 await check("malformed questions are refused before the browser is touched", async () => {
@@ -1856,11 +1864,11 @@ await check("malformed questions are refused before the browser is touched", asy
 
 await check("Jev sees what it already did in this leg", async () => {
   const browser = fakeBrowser({
-    rows: [row({ ref: "ref_1", role: "button", name: "New template" })],
+    rows: [row({ ref: "ref_1", role: "button", name: "New product" })],
     onClick: (s) => {
       s.url = "https://app.test/a?new=true";
       s.rows = [
-        row({ ref: "ref_1", role: "button", name: "New template" }),
+        row({ ref: "ref_1", role: "button", name: "New product" }),
         row({ ref: "ref_2", role: "textbox", name: "Name", type: "text" }),
       ];
     },
@@ -1871,19 +1879,227 @@ await check("Jev sees what it already did in this leg", async () => {
   ]);
   await navigate(browser.callTool, client, CFG, {
     tabId: 1,
-    goal: "open a new template",
+    goal: "open a new product",
     success_criteria: "the form is open",
   });
   eq(client.seen[0].state.history, undefined, "nothing on the first decision");
   const h = client.seen[1].state.history;
   eq(h?.[0]?.operation, "CLICK", "the click is remembered");
-  assert(h?.[0]?.target.includes("New template"), `target: ${h?.[0]?.target}`);
+  assert(h?.[0]?.target.includes("New product"), `target: ${h?.[0]?.target}`);
   eq(h?.[0]?.page_changed, true, "and that it changed the page");
 });
 
 try {
   fs.rmSync(CFG.tracesDir, { recursive: true, force: true });
 } catch {}
+
+// --- waiting, stray typing, read-only fields, questions per leg ------------
+
+await check("an unsure WAIT or DONE waits and looks again instead of handing back", async () => {
+  // A real run stopped after 5 s of a 240 s budget, with WAIT at 0.62 against
+  // DONE at 0.38 while a report was still being built.
+  const map = new Map([["e1", row({ role: "button", name: "Go" })]]);
+  for (const op of ["WAIT", "DONE"]) {
+    const v = validate(
+      {
+        operation: choice(op, 0.54, { WAIT: 0.62, DONE: 0.38 }),
+        click_target: choice("e1", 0.5),
+        sensitive: noul(0),
+        satisfied: noul(0.43),
+      },
+      map,
+      CFG,
+      { allowSensitive: false, values: {} },
+    );
+    assert(v.ok, `${op} should pass as a wait: ${v.reason}`);
+    eq(v.operation, "WAIT", `${op} becomes WAIT`);
+  }
+  const scroll = validate({ operation: choice("SCROLL_DOWN", 0.4), sensitive: noul(0), satisfied: notYet }, map, CFG, {
+    allowSensitive: false,
+    values: {},
+  });
+  eq(scroll.status, "needs_help", "other doubt is still handed back");
+  assert(scroll.reason?.endsWith("for SCROLL_DOWN."), `no dangling "on ." with no target: ${scroll.reason}`);
+});
+
+await check("waiting on slow content is not taken for a loop or for no progress", async () => {
+  // Three WAITs on a page that does not move, then the results arrive.
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Search" })] });
+  let waits = 0;
+  const callTool: typeof browser.callTool = async (name, args) => {
+    if (name === "jev_settle" && args.expect === "change" && ++waits === 3) {
+      browser.state.rows = [...browser.state.rows, row({ ref: "ref_2", role: "link", name: "Blue running shoes" })];
+    }
+    return browser.callTool(name, args);
+  };
+  const client = fakeClient([
+    (state) =>
+      (state.elements?.length ?? 0) > 1
+        ? { operation: choice("DONE", 0.95), sensitive: noul(0), satisfied: noul(0.95) }
+        : { operation: choice("WAIT", 0.9), sensitive: noul(0), satisfied: notYet },
+  ]);
+  const out = await navigate(callTool, client, CFG, {
+    tabId: 1,
+    goal: "wait for the search results to load",
+    success_criteria: "search results are listed",
+  });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(waits, 3, "waited three times");
+});
+
+await check("a WAIT never runs past the call's time budget", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
+  const client = fakeClient([{ operation: choice("WAIT", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "g", success_criteria: "s", max_ms: 3000 });
+  const wait = browser.calls.find((c) => c.name === "jev_settle" && c.args.expect === "change");
+  assert(Number(wait?.args.timeoutMs) <= 2000, `bounded by what is left: ${JSON.stringify(wait?.args)}`);
+});
+
+await check("a value is not typed into a field whose name does not match, unless Jev is sure", async () => {
+  // An optional leg asked to type into a comment box, on a page without one,
+  // typed into an unrelated field at 0.65.
+  const typeInto = (name: string, conf: number, key = "Add a comment") =>
+    validate(
+      {
+        operation: choice("TYPE_TEXT", 0.9),
+        text_target: choice("e1", conf),
+        value_key: choice(key, 0.97),
+        sensitive: noul(0),
+        satisfied: notYet,
+      },
+      new Map([["e1", row({ ref: "ref_68", role: "textbox", name, type: "text" })]]),
+      CFG,
+      { allowSensitive: false, values: { [key]: "Please gift wrap it" } },
+    );
+  const wrong = typeInto("Shipping address", 0.65);
+  eq(wrong.status, "needs_help", "mismatch at 0.65 is refused");
+  assert(wrong.reason?.includes("may not be on this page"), `says why: ${wrong.reason}`);
+  assert(typeInto("Shipping address", 0.9).ok, "a sure pick still goes through");
+  assert(typeInto("Add a comment…", 0.65).ok, "a matching name passes at the ordinary gate");
+  assert(typeInto("Shipping address", 0.65, "q").ok, "a key with no words to compare is not held to it");
+  assert(valueFitsField("email", row({ name: "E-mail address" })), "punctuation does not break a match");
+  assert(valueFitsField("order note", row({ name: "" })), "an unnamed field is not judged");
+});
+
+await check("a read-only field is offered to click, never to type or select", async () => {
+  const field = row({ role: "textbox", name: "Order number", type: "text", readonly: true });
+  assert(isCompatible("CLICK", field), "click");
+  assert(!isCompatible("TYPE_TEXT", field), "no typing");
+  assert(!isCompatible("TYPE_AND_SUBMIT", field), "no submitting");
+});
+
+await check("each leg's questions are answered on the page it ended on, with evidence", async () => {
+  const browser = fakeBrowser({
+    rows: [
+      row({ ref: "ref_1", role: "radio", name: "Summary", checked: true }),
+      row({ ref: "ref_2", role: "radio", name: "Details", checked: false }),
+    ],
+    onClick: (s, args) => {
+      const on = args["ref"];
+      s.rows = s.rows.map((r) => ({ ...r, checked: r.ref === on }));
+    },
+  });
+  const onDetails = () => browser.state.rows.find((r) => r.name === "Details")?.checked === true;
+  const client = fakeClient([
+    (_state, questions) => {
+      // A closing request for a leg carries that leg's questions and no step.
+      if (questions["orders_listed"]) return { orders_listed: noul(0.97), orders_listed__evidence: choice("p1", 0.9) };
+      if (questions["totals_shown"]) return { totals_shown: noul(0.95), totals_shown__evidence: choice("p1", 0.9) };
+      const target = onDetails() ? "e1" : "e2";
+      const done = String(_state["goal"]).includes("Details") ? onDetails() : !onDetails();
+      return done
+        ? { operation: choice("DONE", 0.95), sensitive: noul(0), satisfied: noul(0.95) }
+        : {
+            operation: choice("CLICK", 0.95),
+            click_target: choice(target, 0.95),
+            sensitive: noul(0),
+            satisfied: notYet,
+          };
+    },
+  ]);
+  const out = await navigate(browser.callTool, client, CFG, {
+    tabId: 1,
+    subgoals: [
+      {
+        goal: "Click Details",
+        success_criteria: "Details is selected",
+        questions: [{ key: "orders_listed", type: "yes_no", question: "Is the list of orders shown?" }],
+      },
+      {
+        goal: "Click Summary",
+        success_criteria: "Summary is selected",
+        questions: [{ key: "totals_shown", type: "yes_no", question: "Are the weekly totals shown?" }],
+      },
+    ],
+  });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(out.subgoals?.[0]?.answers?.orders_listed?.yes, 0.97, "leg 1 answered");
+  eq(out.subgoals?.[1]?.answers?.totals_shown?.yes, 0.95, "leg 2 answered");
+  eq(out.subgoals?.[0]?.answers?.orders_listed?.evidence, "page body text", "quoted from the page");
+  const asked = client.seen.find((x) => x.questions["orders_listed"]);
+  assert(asked?.state["page_text"] === "[1] page body text", `numbered passages: ${String(asked?.state["page_text"])}`);
+  const snap = browser.calls.find((c) => c.name === "jev_snapshot" && c.args.full_text === true);
+  assert(snap, "the questions read the whole page, not only what is in view");
+});
+
+await check("a skipped leg's questions are not asked", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
+  const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
+  const out = await navigate(browser.callTool, client, CFG, {
+    tabId: 1,
+    subgoals: [
+      {
+        goal: "type into the chat",
+        success_criteria: "typed",
+        optional: true,
+        questions: [{ key: "typed", type: "yes_no", question: "Is the text in the box?" }],
+      },
+      { goal: "stay", success_criteria: "s" },
+    ],
+  });
+  eq(out.subgoals?.[0]?.skipped, true, "skipped");
+  eq(out.subgoals?.[0]?.answers, undefined, "not answered");
+  assert(!client.seen.some((x) => x.questions["typed"]), "never asked");
+});
+
+await check("questions alone answer about the page as it is, in one request", async () => {
+  const browser = fakeBrowser({ rows: [row({ ref: "ref_1", role: "button", name: "Go" })] });
+  const client = fakeClient([{ shown: noul(0.9) }]);
+  const out = await navigate(browser.callTool, client, CFG, {
+    tabId: 1,
+    questions: [{ key: "shown", type: "yes_no", question: "Is the banner shown?" }],
+  });
+  eq(out.status, "done", `reason: ${out.reason}`);
+  eq(client.seen.length, 1, "no step decisions");
+  eq(out.answers?.shown?.yes, 0.9, "answered");
+  eq(out.answers_note, undefined, "no note on a run that did not stop");
+  assert(!browser.calls.some((c) => c.name === "jev_act"), "nothing touched");
+});
+
+await check("a call with nothing to do is refused", async () => {
+  const browser = fakeBrowser();
+  const out = await navigate(browser.callTool, fakeClient([]), CFG, { tabId: 1 });
+  eq(out.status, "error", "status");
+  eq(browser.calls.length, 0, "browser untouched");
+});
+
+await check("a leg's malformed questions are refused before the browser is touched", async () => {
+  const browser = fakeBrowser();
+  const out = await navigate(browser.callTool, fakeClient([]), CFG, {
+    tabId: 1,
+    subgoals: [
+      { goal: "g", success_criteria: "s" },
+      {
+        goal: "h",
+        success_criteria: "t",
+        questions: [{ key: "p", type: "choice", question: "one", options: { a: "A" } }],
+      },
+    ],
+  });
+  eq(out.status, "error", "status");
+  assert(out.reason?.startsWith("Subgoal 2:"), `names the leg: ${out.reason}`);
+  eq(browser.calls.length, 0, "browser untouched");
+});
 
 const failed = results.filter((r) => !r.ok);
 console.log(

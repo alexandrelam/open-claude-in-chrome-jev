@@ -19,7 +19,8 @@ Start with `tabs_context_mcp`, then `tabs_create_mcp`: work in a new tab and nev
 
 - Every leg of the task goes in `subgoals`, all text in `values`, and `start_url` for where to begin. For legs you can't see yet, describe the outcome ("fill the form and save it"), not field names you'd be guessing.
 - `success_criteria` names **where you are**, not page content: "the revision history is open", not "a list of revisions is shown". State that lives in the URL goes as key=value (`tab=billing in the URL`), which is checked exactly.
-- Verification goes in `questions` (see Questions below), not screenshots. Add `final_check` when a later leg could undo an earlier one.
+- Verification goes in `questions` (see Questions below), not screenshots or `javascript_tool`. Add `final_check` when a later leg could undo an earlier one.
+- A leg can wait for slow content (a report being built, search results): say so in its goal ("wait until the results have loaded") and success_criteria, and raise `max_ms` to match. Don't poll with `javascript_tool`.
 - `fill_defaults: true` only when any option will do (test data). `allow_sensitive: true` only when the user asked for that save, send, pay or delete.
 - When it hands back, stay in Jev:
 
@@ -54,7 +55,20 @@ Answers come back per page, each with `evidence`, the passage it rests on quoted
 ```
 
 - In **jev_assess** the questions are asked of every item; you get one row per item plus a `summary` per question (yes/no counts, counts per choice, mean score).
-- In **jev_navigate** they are asked once, of the page the run ends on, and come back under `answers`. Use them to verify the task ("is the Enable switch now off?") instead of a screenshot.
+- In **jev_navigate**, `questions` are asked of the page the run ends on and come back under `answers`, with `evidence` quoted from the page. If a leg stops the run they are still answered, about the page it stopped on, and `answers_note` says so.
+- A leg can carry its **own** `questions`, answered as soon as that leg is done and returned in `subgoals[i].answers`. This is how a test plan runs in **one call**: one leg per step, the check for that step on the leg.
+- To only ask about the page as it is, call `jev_navigate` with `questions` and no `goal` or `subgoals`. Never write a "do nothing" leg for it.
+
+```js
+subgoals: [
+  { goal: "Click the Details tab", success_criteria: "the Details tab is selected",
+    questions: [{ key: "orders_listed", type: "yes_no", question: "Is the list of orders shown?" }] },
+  { goal: "Type the note in the Comment box, without sending it", success_criteria: "the Comment box holds the note",
+    values: { "Comment": "Please gift wrap it" }, optional: true },
+  { goal: "Click Summary, then Details again", success_criteria: "the Details tab is selected",
+    questions: [{ key: "comment_kept", type: "yes_no", question: "Does the Comment box still hold 'Please gift wrap it'?" }] },
+]
+```
 
 ## Judging many items: jev_assess
 

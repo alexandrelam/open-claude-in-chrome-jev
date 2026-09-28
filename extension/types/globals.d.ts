@@ -71,6 +71,7 @@ interface ContentRow {
   selected?: string;
   disabled?: true;
   required?: true;
+  readonly?: true;
   section?: string;
   options?: Array<{ value: string; label: string; selected: boolean }>;
   indent?: number;
@@ -140,11 +141,18 @@ interface ContentRequests {
     res: { result: JevGuardResult };
   };
   jevSettle: {
-    req: { mode: "quiet" | "combobox" | "dom"; ref?: string | undefined; timeoutMs: number };
-    res: { result: "timeout" | "quiet" | "settled" };
+    req: { mode: "quiet" | "combobox" | "dom" | "change"; ref?: string | undefined; timeoutMs: number };
+    res: { result: "timeout" | "quiet" | "settled" | "changed" };
   };
   jevSnapshot: {
-    req: { options: { depth?: number | undefined; max_rows?: number | undefined; text_chars?: number | undefined } };
+    req: {
+      options: {
+        depth?: number | undefined;
+        max_rows?: number | undefined;
+        text_chars?: number | undefined;
+        full_text?: boolean | undefined;
+      };
+    };
     res: { result: JevSnapshot };
   };
   getPageText: { req: object; res: { result: string } };

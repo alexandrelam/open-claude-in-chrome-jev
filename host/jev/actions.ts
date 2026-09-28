@@ -134,6 +134,9 @@ export function isCompatible(operation: string, row: Row | null | undefined): bo
   // it is a no-op the loop would misread as "the page didn't change".
   if (row.disabled) return false;
   const role = (row.role || "").toLowerCase();
+  // A read-only field ignores typing, so it can only be clicked. Typing into
+  // one reads as "the page did not change", a wasted step.
+  if (row.readonly && operation !== "CLICK") return false;
   switch (operation) {
     case "CLICK":
       // An anchor often renders with no role at all; its href is what makes it
@@ -285,7 +288,7 @@ export function planToolCalls(
   row: Row | null | undefined,
   value: string | undefined,
   tabId: number,
-  { jevTools = false }: { jevTools?: boolean } = {},
+  { jevTools = false, waitMs = 5000 }: { jevTools?: boolean; waitMs?: number } = {},
 ): PlannedCall[] {
   // One jev_act call per operation when the extension has it: one round trip
   // instead of up to three, and the target is checked before it is touched.
@@ -343,10 +346,13 @@ export function planToolCalls(
         ["computer", { action: "scroll", coordinate: [400, 300], scroll_direction: "up", scroll_amount: 5, tabId }],
       ];
     case "WAIT":
-      // A quarter second and then two frames, as jev-ultrafast does, rather
-      // than a flat second. An extension without jev_settle gets the second.
+      // Until the page changes and goes quiet, up to waitMs. WAIT is chosen
+      // when something is still coming in (a report being built, search
+      // results), and the quarter second it used to be was over before any of
+      // that arrived. A page that is already moving returns in ~150 ms. An
+      // extension without jev_settle gets a flat second.
       return jevTools
-        ? [["jev_settle", { tabId, expect: "wait", timeoutMs: 250 }]]
+        ? [["jev_settle", { tabId, expect: "change", timeoutMs: waitMs }]]
         : [["computer", { action: "wait", duration: 1, tabId }]];
     default:
       return [];

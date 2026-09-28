@@ -51,6 +51,8 @@ export interface Row {
   selected?: Flag;
   disabled?: boolean;
   required?: boolean;
+  /** A field that shows a value but does not take typing. */
+  readonly?: boolean;
   options: RowOption[] | null;
   /** Whether the element is on screen. Only a jev_snapshot observation knows. */
   inView?: boolean | undefined;

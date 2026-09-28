@@ -24,6 +24,7 @@
       value?: unknown;
       disabled?: unknown;
       required?: unknown;
+      readOnly?: unknown;
       checked?: unknown;
       href?: unknown;
       src?: unknown;
@@ -312,7 +313,7 @@
   }
 
   // The text a custom select shows as its current choice. A styled combobox is
-  // a <div> with no value property, so without this an empty "Visit type"
+  // a <div> with no value property, so without this an empty "Category"
   // picker and a filled one render identically, and nothing can report that a
   // required field was left blank.
   function displayedChoice(el: Loose, tag: string, role: string | null, name: string): string {
@@ -342,6 +343,10 @@
     }
     if (isEffectivelyDisabled(el)) row.disabled = true;
     if (el.required || el.getAttribute("aria-required") === "true") row.required = true;
+    // Said so Jev can answer "is the title read-only?" from the row itself, and
+    // so the gate never offers a field that ignores typing as a text target.
+    if ((["input", "textarea"].includes(tag) && el.readOnly === true) || el.getAttribute("aria-readonly") === "true")
+      row.readonly = true;
     // Which part of the page this control belongs to. Without it a form of
     // repeated cards is an undifferentiated list in which the same label
     // appears once per card and none of them can be told apart.
@@ -371,6 +376,7 @@
     if (row.selected) line += ` selected=${row.selected}`;
     if (row.disabled) line += " disabled";
     if (row.required) line += " required";
+    if (row.readonly) line += " readonly";
     if (row.section) line += ` section="${row.section}"`;
     if (row.options) {
       line += ` options=[${row.options.map((o) => `${o.selected ? "*" : " "}${o.value}="${o.label}"`).join(", ")}]`;
@@ -476,7 +482,10 @@
   // Text the user can actually see: text nodes inside the main content region
   // (the same region get_page_text picks) whose box intersects the viewport.
   // Off-screen article bodies and footers never reach the decision model.
-  function visibleText(maxChars: number): string {
+  // In view only, by default: that is what a step decides on. `wholePage`
+  // reads every rendered text node instead, for questions about the page's
+  // content, which is often below the fold (a list under its banner).
+  function visibleText(maxChars: number, wholePage = false): string {
     const root = pickContentRoot();
     const words: string[] = [];
     let length = 0;
@@ -489,7 +498,8 @@
       if (!value || !parent || parent.closest("script,style,noscript,template,svg")) continue;
       range.selectNodeContents(node);
       const r = range.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth) {
+      const inView = r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+      if (r.width > 0 && r.height > 0 && (wholePage || inView)) {
         words.push(value);
         length += value.length + 1;
       }
@@ -539,6 +549,18 @@
           characterData: true,
         });
         arm();
+        return;
+      }
+      // mode "change" is Jev's WAIT: the page is working on something (a
+      // report being built, a search) and the next decision is only worth making
+      // once it shows. Resolve when the DOM changes and then goes quiet, or on
+      // timeoutMs if nothing ever moves.
+      if (mode === "change") {
+        observer = new MutationObserver(() => {
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(() => finish("changed"), QUIET_MS);
+        });
+        observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
         return;
       }
       const field = mode === "combobox" && ref ? resolveRef(ref) : null;
@@ -619,7 +641,7 @@
       title: document.title || "",
       rows,
       truncated,
-      text: visibleText(options.text_chars || 2000),
+      text: visibleText(options.text_chars || 2000, options.full_text === true),
       scroll: { y: Math.round(scrollY), height, viewport: innerHeight },
     };
   }

@@ -59,6 +59,7 @@ export interface ToolArgsMap {
     depth?: number | undefined;
     max_rows?: number | undefined;
     text_chars?: number | undefined;
+    full_text?: boolean | undefined;
   };
   jev_settle: {
     tabId: number;

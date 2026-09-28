@@ -44,6 +44,7 @@ export function renderRow(row: Row, id: string): string {
   // Said outright, not left to inference: a disabled Save is usually the
   // reason a form leg is stuck, and Jev can only report that if it sees it.
   if (row.disabled) extra.push("disabled");
+  if (row.readonly) extra.push("readonly");
   if (row.options?.length)
     extra.push(
       `options=${row.options

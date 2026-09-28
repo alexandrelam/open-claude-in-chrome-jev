@@ -21,6 +21,7 @@ import {
   isToolError,
   observationSignature,
 } from "../jev/observe.ts";
+import { renderRow } from "../jev/shortlist.ts";
 import { errorMessage } from "../errors.ts";
 
 const results: Array<{ name: string; ok: boolean; err?: string }> = [];
@@ -182,12 +183,40 @@ check("the excerpt keeps the page's subject even when it is also a link", () => 
   // — losing the one word that says where you are.
   const rows = [
     { name: "Octopus", role: "link", section: "" },
+    { name: "Read", role: "link", section: "" },
+    { name: "Edit", role: "link", section: "" },
     { name: "View history", role: "link", section: "" },
   ];
-  const text = "Octopus: Revision history View history Octopus is a soft-bodied mollusc.";
+  const text = "Octopus: Revision history Read Edit View history Octopus is a soft-bodied mollusc.";
   const out = dropElementEcho(text, rows, "Octopus: Revision history - Wikipedia");
   assert(out.includes("Octopus"), `subject must survive: ${out}`);
-  assert(!out.includes("View history"), `ordinary echo is still removed: ${out}`);
+  assert(!out.includes("View history"), `the navigation run is still removed: ${out}`);
+});
+
+check("a control's name inside a sentence is kept; only runs of names go", () => {
+  // Removing every occurrence turned a banner into nonsense on a page whose
+  // tabs share its words, and hid a message from a question asking whether it
+  // was shown: Jev answered 0.15 while it was on screen.
+  const rows = ["Summary", "Totals", "Orders", "Save", "Cancel", "Export", "Revenue", "Costs"].map((name) => ({
+    name,
+    role: "button",
+    section: "",
+  }));
+  const text =
+    "Orders Save Cancel Weekly report Summary · Totals These totals use yesterday's data. " +
+    "Export this report to share it. Revenue: 12,400 € this week. Costs: 3,100 €.";
+  const out = dropElementEcho(text, rows, "Dashboard");
+  assert(out.includes("These totals use yesterday's data."), `banner intact: ${out}`);
+  assert(out.includes("Export this report to share it."), `message intact: ${out}`);
+  assert(out.includes("Revenue: 12,400") && out.includes("Costs: 3,100"), `headings intact: ${out}`);
+  assert(!out.includes("Orders Save Cancel"), `the toolbar run is removed: ${out}`);
+  assert(!/Summary\s*·\s*Totals/.test(out), `the tab strip is removed: ${out}`);
+});
+
+check("readonly is parsed from read_page and rendered for Jev", () => {
+  const r = parseLine('textbox "Order number" [ref_4] value="A-1042" type="text" readonly');
+  eq(r?.readonly, true, "parsed");
+  assert(r && renderRow(r, "e1").includes("readonly"), "rendered");
 });
 
 check("non-element lines are skipped, not guessed at", () => {
@@ -213,7 +242,7 @@ check("usableRows keeps disabled controls as context, marked", () => {
 });
 
 check("parseLine carries required, alongside disabled and section", () => {
-  const r = parseLine('combobox "Visit type" [ref_4] disabled required section="Details"')!;
+  const r = parseLine('combobox "Category" [ref_4] disabled required section="Details"')!;
   eq(r.required, true, "required");
   eq(r.disabled, true, "disabled");
   eq(r.section, "Details", "section");

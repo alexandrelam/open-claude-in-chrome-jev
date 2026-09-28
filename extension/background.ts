@@ -482,6 +482,14 @@ async function ensureAttached(tabId: number): Promise<void> {
       });
       console.warn("setFocusEmulationEnabled unavailable:", errorMessage(e));
     }
+    // Record network requests from the moment the tab is attached, not from
+    // the first read_network_requests: enabling it there meant the first read
+    // was always empty, and "did that click fire a request?" cost a second
+    // action and a second read. Best-effort, like the emulation above.
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Network.enable", {});
+      attachedTabs.get(tabId)?.enabledDomains.add("Network");
+    } catch {}
   })();
   attachingTabs.set(tabId, attach);
   try {
@@ -1777,6 +1785,9 @@ const toolHandlers: ToolHandlers = {
       if (!URL.canParse(targetUrl)) {
         return { content: [{ type: "text", text: `Invalid URL: "${url}". Could not parse as a valid URL.` }] };
       }
+      // Attach before loading, so the page's own requests are recorded too
+      // (ensureAttached turns network recording on).
+      await ensureAttached(tabId).catch(() => {});
       await chrome.tabs.update(tabId, { url: targetUrl });
     }
 
@@ -2339,7 +2350,12 @@ const toolHandlers: ToolHandlers = {
     try {
       resp = await sendContentMessage(tabId, {
         type: "jevSnapshot",
-        options: { depth: args.depth, max_rows: args.max_rows, text_chars: args.text_chars },
+        options: {
+          depth: args.depth,
+          max_rows: args.max_rows,
+          text_chars: args.text_chars,
+          full_text: args.full_text,
+        },
       });
     } catch (e) {
       return { content: [{ type: "text", text: `Error: Could not snapshot the page: ${errorMessage(e)}` }] };
@@ -2357,6 +2373,8 @@ const toolHandlers: ToolHandlers = {
   //     changing, <=1200 ms. For a page that has just loaded.
   //   expect "combobox": until the field's suggestions are visible, <=200 ms.
   //   expect "wait": timeoutMs of plain waiting, then a frame settle.
+  //   expect "change": until the DOM changes and goes quiet, bounded by
+  //     timeoutMs (<=10 s). Jev's WAIT, for a page still producing content.
   //   anything else: two animation frames, <=50 ms.
   async jev_settle(args) {
     const { tabId, expect = "dom", fromUrl, ref } = args;
@@ -2371,16 +2389,21 @@ const toolHandlers: ToolHandlers = {
     }
     const quiet = expect === "quiet" || (expect === "navigation" && urlChanged);
     const QUIET_CAP_MS = 1200;
+    const CHANGE_CAP_MS = 10_000;
+    const mode = quiet ? "quiet" : expect === "combobox" ? "combobox" : expect === "change" ? "change" : "dom";
+    const timeoutMs =
+      mode === "quiet"
+        ? QUIET_CAP_MS
+        : mode === "combobox"
+          ? 200
+          : mode === "change"
+            ? Math.min(args.timeoutMs ?? 5000, CHANGE_CAP_MS)
+            : 50;
     let frames: string | null = null;
     try {
       const resp = await withTimeout(
-        sendContentMessage(tabId, {
-          type: "jevSettle",
-          mode: quiet ? "quiet" : expect === "combobox" ? "combobox" : "dom",
-          ref,
-          timeoutMs: quiet ? QUIET_CAP_MS : expect === "combobox" ? 200 : 50,
-        }),
-        QUIET_CAP_MS + 800,
+        sendContentMessage(tabId, { type: "jevSettle", mode, ref, timeoutMs }),
+        timeoutMs + 800,
         "jev_settle",
       );
       frames = resp?.result ?? null;

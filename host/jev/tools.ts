@@ -30,7 +30,7 @@ const NAVIGATE_SHAPE = {
     .string()
     .optional()
     .describe(
-      'A single subgoal in natural language, e.g. "open the most recent invoice". Use this or `subgoals`, not both.',
+      'A single subgoal in natural language, e.g. "open the most recent invoice". Use this or `subgoals`, not both. Leave both out to only answer `questions` about the page as it is.',
     ),
   subgoals: z
     .array(
@@ -44,6 +44,12 @@ const NAVIGATE_SHAPE = {
           .optional()
           .describe(
             "If this leg fails, skip it and run the next one from wherever the page was left. Use for legs nothing later depends on, like dismissing a banner. Overrides continue_on_failure for this leg.",
+          ),
+        questions: z
+          .array(QUESTION)
+          .optional()
+          .describe(
+            "Checks for the page this leg ends on, answered as soon as it is done and returned under this leg's `answers`, each with its evidence. Use them to verify every step of a test plan in one call: 'open Details' then 'is the order list shown?', 'go back' then 'is the draft kept?'. Keys only need to be unique within the leg.",
           ),
       }),
     )
@@ -62,7 +68,7 @@ const NAVIGATE_SHAPE = {
     .string()
     .optional()
     .describe(
-      'Observable condition for `goal`, e.g. "an invoice detail page with a total is shown". Checked on every step. Prefer criteria about WHERE you are over criteria about page content — "the revision history view is open" reads far more reliably than "a list of revisions with dates is shown", because the check sees the page\'s controls plus a short text excerpt rather than the full body. When the app puts state in the URL, say so as key=value ("newEncounterProfile=true in the URL"): that part is checked exactly. Required with `goal`; use the per-leg field inside `subgoals` instead.',
+      'Observable condition for `goal`, e.g. "an invoice detail page with a total is shown". Checked on every step. Prefer criteria about WHERE you are over criteria about page content — "the revision history view is open" reads far more reliably than "a list of revisions with dates is shown", because the check sees the page\'s controls plus a short text excerpt rather than the full body. When the app puts state in the URL, say so as key=value ("new=true in the URL"): that part is checked exactly. Required with `goal`; use the per-leg field inside `subgoals` instead.',
     ),
   values: z
     .record(z.string())
@@ -75,7 +81,7 @@ const NAVIGATE_SHAPE = {
     .array(QUESTION)
     .optional()
     .describe(
-      'Your questions about the page the run ends on, answered by Jev once every leg has finished (in the same request as final_check), and returned under `answers` as probabilities. Use them for verification — "is the Enable switch off?", "does the list show the new item?" — instead of taking a screenshot or reading the page yourself. Not asked when a leg stopped the run.',
+      'Your questions about the page the run ends on, answered by Jev once every leg has finished (in the same request as final_check), and returned under `answers` as probabilities, each with `evidence`: the passage of the page it rests on, quoted verbatim. Use them for verification — "is the Enable switch off?", "does the list show the new item?" — instead of taking a screenshot or reading the page yourself. When a leg stops the run they are still answered, about the page it stopped on, and `answers_note` says so. With no `goal` or `subgoals`, the call only answers these about the current page.',
     ),
   start_url: z.string().optional().describe("Navigate here before the first step. The loop itself can never navigate."),
   final_check: z
@@ -226,7 +232,7 @@ export const JEV_TOOLS: ToolDefinition[] = [
   {
     name: "jev_navigate",
     description:
-      "Delegate browser work to the Jev decision model, which picks each next action while the extension carries it out in the real profile. Put the WHOLE task in one call: the navigation and form legs as `subgoals`, the text to type as `values`, `fill_defaults` for choice fields you don't care about, and the check you would otherwise do by reading the page as `questions`.\n\nWhen it hands back (needs_help, needs_value, blocked), stay in Jev. `reason` and `blockers` say what is in the way (e.g. Save is disabled, and these fields are empty). Call again with fix-up legs followed by `remaining_subgoals`, which is returned for exactly that. If one step truly needs the ordinary tools, act by `ref` from `page_excerpt.interactive`, not by screenshot coordinates, and go back to jev_navigate for the rest.\n\nReturns the status, the steps taken, `answers` to your questions, and the final page's controls by ref. A status of partial means every leg ran but some optional ones were skipped; `reason` lists them.",
+      "Delegate browser work to the Jev decision model, which picks each next action while the extension carries it out in the real profile. Put the WHOLE task in one call: the navigation and form legs as `subgoals`, the text to type as `values`, `fill_defaults` for choice fields you don't care about, and the check you would otherwise do by reading the page as `questions` — per leg for a check that belongs after one step (a test plan), or for the whole run. A leg can wait for slow content (a report being built, search results): say so in its goal and success_criteria, and give the call a max_ms to match.\n\nWhen it hands back (needs_help, needs_value, blocked), stay in Jev. `reason` and `blockers` say what is in the way (e.g. Save is disabled, and these fields are empty). Call again with fix-up legs followed by `remaining_subgoals`, which is returned for exactly that. If one step truly needs the ordinary tools, act by `ref` from `page_excerpt.interactive`, not by screenshot coordinates, and go back to jev_navigate for the rest.\n\nReturns the status, the steps taken, `answers` to your questions, and the final page's controls by ref. A status of partial means every leg ran but some optional ones were skipped; `reason` lists them.",
     paramShape: NAVIGATE_SHAPE,
   },
   {
