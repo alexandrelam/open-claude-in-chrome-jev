@@ -76,6 +76,23 @@ interface ContentRow {
   options?: Array<{ value: string; label: string; selected: boolean }>;
   indent?: number;
   inView?: boolean;
+  /** The page-map region the element sits in, when the snapshot asked for a map. */
+  region?: string;
+}
+
+/** One region of the page map (content.ts buildPageMap). */
+interface PageRegion {
+  id: string;
+  parent: string | null;
+  kind: "page" | "landmark" | "region" | "section" | "list" | "item" | "dialog";
+  name: string;
+  /** Rendered text the region holds itself, not counting its child regions. */
+  text: string;
+  /** Text that is in the DOM but not rendered: collapsed panels, closed tabs. */
+  hidden?: string;
+  /** Top of the region in page coordinates. */
+  y?: number;
+  inView?: boolean;
 }
 
 interface AccessibilityOptions {
@@ -92,6 +109,8 @@ interface JevSnapshot {
   truncated: boolean;
   text: string;
   scroll: { y: number; height: number; viewport: number };
+  regions?: PageRegion[];
+  map_truncated?: boolean;
 }
 
 /** What describePoint found at a viewport coordinate. */
@@ -151,6 +170,7 @@ interface ContentRequests {
         max_rows?: number | undefined;
         text_chars?: number | undefined;
         full_text?: boolean | undefined;
+        map?: boolean | undefined;
       };
     };
     res: { result: JevSnapshot };

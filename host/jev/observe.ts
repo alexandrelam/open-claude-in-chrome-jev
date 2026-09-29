@@ -22,6 +22,7 @@ import type {
   Flag,
   Observation,
   ObservationResult,
+  PageRegion,
   Row,
   RowOption,
   ScrollState,
@@ -337,6 +338,7 @@ interface SnapshotRow {
   readonly?: boolean;
   options?: RowOption[];
   inView?: boolean;
+  region?: string;
 }
 
 interface Snapshot {
@@ -346,6 +348,8 @@ interface Snapshot {
   text?: string;
   truncated?: boolean;
   scroll?: ScrollState;
+  regions?: PageRegion[];
+  map_truncated?: boolean;
 }
 
 function snapshotRow(r: SnapshotRow): Row {
@@ -372,6 +376,7 @@ function snapshotRow(r: SnapshotRow): Row {
     ...(r.readonly ? { readonly: true } : {}),
     options: Array.isArray(r.options) ? r.options : null,
     inView: r.inView,
+    ...(r.region ? { region: r.region } : {}),
   };
 }
 
@@ -404,6 +409,11 @@ export interface ObserveOptions {
   fullText?: boolean;
   maxChars?: number;
   depth?: number;
+  /**
+   * Also map the whole page into regions (content.ts buildPageMap), for
+   * explore.ts. Only an extension with jev_snapshot has it.
+   */
+  map?: boolean;
 }
 
 export async function observe(
@@ -413,12 +423,12 @@ export async function observe(
 ): Promise<ObservationResult> {
   const { excerptChars = 300 } = opts;
   if (snapshotSupport.get(callTool) !== false) {
-    const res = await callTool(
-      "jev_snapshot",
-      opts.fullText
-        ? { tabId, depth: opts.depth ?? 30, full_text: true, text_chars: excerptChars }
-        : { tabId, depth: opts.depth ?? 30 },
-    );
+    const res = await callTool("jev_snapshot", {
+      tabId,
+      depth: opts.depth ?? 30,
+      ...(opts.fullText ? { full_text: true, text_chars: excerptChars } : {}),
+      ...(opts.map ? { map: true } : {}),
+    });
     const text = resultText(res);
     if (isToolError(res) && !/Unknown tool/i.test(text)) return { error: text };
     let snap: Snapshot | null = null;
@@ -442,6 +452,7 @@ export async function observe(
         truncated: Boolean(snap.truncated),
         excerpt,
         scroll: snap.scroll ?? null,
+        ...(Array.isArray(snap.regions) ? { regions: snap.regions, mapTruncated: Boolean(snap.map_truncated) } : {}),
       };
     }
     snapshotSupport.set(callTool, false);

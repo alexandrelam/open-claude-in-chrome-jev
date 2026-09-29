@@ -32,6 +32,9 @@ interface JevFileConfig {
   sensitive_threshold?: unknown;
   allowed_domains?: unknown;
   blocked_domains?: unknown;
+  explore_beam?: unknown;
+  explore_max_rounds?: unknown;
+  explore_leaf_chars?: unknown;
 }
 
 export interface ConfigFile {
@@ -62,6 +65,9 @@ const DEFAULTS: {
   sensitive_threshold: number;
   allowed_domains: string[] | null;
   blocked_domains: string[];
+  explore_beam: number;
+  explore_max_rounds: number;
+  explore_leaf_chars: number;
 } = {
   provider: "openrouter",
   openrouter_base_url: "https://openrouter.ai/api/alpha",
@@ -93,6 +99,14 @@ const DEFAULTS: {
   sensitive_threshold: 0.5,
   allowed_domains: null,
   blocked_domains: [],
+  // Page exploration (explore.ts). A page whose text fits explore_leaf_chars
+  // is read in one request; a longer one is scored region by region, keeping
+  // the clearly relevant regions plus the best explore_beam others each round,
+  // for at most explore_max_rounds rounds. 24k characters is ~6k tokens: well
+  // inside Jev's 32k window with room for the questions and the elements.
+  explore_beam: 4,
+  explore_max_rounds: 3,
+  explore_leaf_chars: 24_000,
 };
 
 // Hard ceiling from the PRD: a caller may lower max_steps, never raise it past
@@ -156,6 +170,9 @@ export function resolveConfig(
     allowedDomains: list(env.JEV_ALLOWED_DOMAINS, list(j.allowed_domains, DEFAULTS.allowed_domains)),
     blockedDomains: list(env.JEV_BLOCKED_DOMAINS, list(j.blocked_domains, DEFAULTS.blocked_domains)),
     tracesDir: path.join(CONFIG_DIR, "jev-runs"),
+    exploreBeam: num(env.JEV_EXPLORE_BEAM, num(j.explore_beam, DEFAULTS.explore_beam)),
+    exploreMaxRounds: num(env.JEV_EXPLORE_MAX_ROUNDS, num(j.explore_max_rounds, DEFAULTS.explore_max_rounds)),
+    exploreLeafChars: num(env.JEV_EXPLORE_LEAF_CHARS, num(j.explore_leaf_chars, DEFAULTS.explore_leaf_chars)),
   };
 }
 

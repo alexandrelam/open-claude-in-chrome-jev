@@ -16,9 +16,12 @@ import { isToolError, resultText } from "./observe.ts";
 import { BudgetExceeded } from "./client.ts";
 import { buildQuestions, questionsError, compactAnswer } from "./questions.ts";
 import { EVIDENCE_SUFFIX, splitPassages, numberedText, evidenceQuestions, pickEvidence } from "./evidence.ts";
+import { pool } from "./pool.ts";
+import { buildGraph, exploreSettings, graphFromText, readForQuestions, rethink } from "./explore.ts";
+import type { Coverage, Graph, PageReading } from "./explore.ts";
 import { errorMessage } from "../errors.ts";
 import type { AssessArgs, AssessItem, WhereCondition } from "./tools.ts";
-import type { CallTool, ClaudeQuestion, CompactAnswer, JevClient, JevConfig } from "./types.ts";
+import type { CallTool, ClaudeQuestion, CompactAnswer, JevClient, JevConfig, PageRegion } from "./types.ts";
 
 /** One item to judge. Items from items_script may carry a per-item step cap. */
 type Item = AssessItem & { max_steps?: number | undefined };
@@ -31,6 +34,8 @@ export interface AssessRow {
   status: string;
   reason?: string;
   answers?: Record<string, CompactAnswer | null>;
+  /** Set when the page was too long to read whole: how much of it the answers rest on. */
+  coverage?: Coverage;
   excerpt?: string;
   final_url?: string;
   title?: string;
@@ -169,21 +174,6 @@ async function readPage(
   return { error: "Could not read the page." };
 }
 
-/** Run `fn` over `items` with at most `n` in flight, keeping order. */
-async function pool<T, R>(items: readonly T[], n: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
-  const out: R[] = Array.from({ length: items.length });
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(n, items.length) }, async () => {
-      while (next < items.length) {
-        const i = next++;
-        out[i] = await fn(items[i] as T, i);
-      }
-    }),
-  );
-  return out;
-}
-
 /**
  * Items built by Claude's script on the page: the extraction that used to be
  * its own round trip ("list the ads, then judge them") runs inside this call.
@@ -251,6 +241,40 @@ function whereError(where: unknown, questions: readonly Pick<ClaudeQuestion, "ke
   return null;
 }
 
+// The most page text read for one item before exploring it. Past this the
+// page is not read at all, and the coverage says so.
+const MAX_READ_CHARS = 300_000;
+
+/** Is this answer below the confidence Claude would act on? */
+function unsure(a: CompactAnswer | null | undefined, min: number): boolean {
+  if (!a) return true;
+  const c = a.yes !== undefined ? Math.abs(a.yes - 0.5) * 2 : (a.p ?? a.confidence ?? 0);
+  return c < min;
+}
+
+/** How sure a set of answers is, on average, to compare two readings. */
+function sureness(answers: Record<string, CompactAnswer | null>, questions: readonly ClaudeQuestion[]): number {
+  return (
+    questions.reduce((a, q) => {
+      const x = answers[q.key];
+      return a + (!x ? 0 : x.yes !== undefined ? Math.abs(x.yes - 0.5) * 2 : (x.p ?? x.confidence ?? 0));
+    }, 0) / Math.max(1, questions.length)
+  );
+}
+
+/** The tab's page as regions, or null when the extension cannot map it. */
+async function mapGraph(callTool: CallTool, tabId: number, title: string | undefined): Promise<Graph | null> {
+  const res = await callTool("jev_snapshot", { tabId, map: true, max_rows: 1 });
+  if (isToolError(res)) return null;
+  try {
+    const snap = JSON.parse(resultText(res)) as { regions?: PageRegion[]; map_truncated?: boolean; title?: string };
+    if (!Array.isArray(snap.regions)) return null;
+    return buildGraph(snap.regions, [], { title: snap.title ?? title ?? "", truncated: Boolean(snap.map_truncated) });
+  } catch {
+    return null;
+  }
+}
+
 /** Backs the jev_assess tool. */
 export async function assess(
   callTool: CallTool,
@@ -303,6 +327,14 @@ export async function assess(
 
   const jevQuestions = buildQuestions(questions);
   let stopped: string | null = null;
+  // A page longer than one request is explored (explore.ts) rather than cut:
+  // read whole up to the explorer's budget, else by region.
+  const exploreMode = args.explore ?? "auto";
+  const settings = exploreSettings(cfg);
+  const leafChars = Math.max(maxChars, settings.leafChars);
+  const readChars = exploreMode === "never" ? maxChars : MAX_READ_CHARS;
+  const intent = [context, ...questions.map((q) => q.question)].filter(Boolean).join(" ");
+  const decide = (state: unknown, qs: Parameters<JevClient["decide"]>[1]) => client.decide(state, qs);
 
   const judge = async (item: Item, page: Page): Promise<Record<string, CompactAnswer | null>> => {
     // With evidence on, Jev reads the page as numbered passages and names the
@@ -339,10 +371,11 @@ export async function assess(
       stopped = "time limit reached";
       return { ...row, status: "skipped", reason: stopped };
     }
+    const browsed = Boolean(item.url || item.goal);
     try {
       let page: Page;
       if (item.text != null && !item.url && !item.goal) {
-        page = { text: item.text.slice(0, maxChars) };
+        page = { text: item.text.slice(0, readChars) };
       } else {
         // Only Claude's URLs are ever opened, and the domain rules apply
         // before anything is fetched or sent.
@@ -381,7 +414,7 @@ export async function assess(
           if (isToolError(res)) return { ...row, status: "error", reason: resultText(res) };
           await callTool("jev_settle", { tabId, expect: "quiet" });
         }
-        const read = await readPage(callTool, tabId as number, item.selector ?? selector, maxChars);
+        const read = await readPage(callTool, tabId as number, item.selector ?? selector, readChars);
         if ("error" in read) return { ...row, status: "error", reason: read.error };
         page = read;
         if (!domainAllowed(page.url, cfg)) {
@@ -395,11 +428,40 @@ export async function assess(
         if (page.title) row.title = page.title;
       }
       if (!page.text) return { ...row, status: "error", reason: "The page had no readable text." };
-      const answers = await judge(item, page);
+      let answers: Record<string, CompactAnswer | null>;
+      let coverage: Coverage | null = null;
+      if (exploreMode === "never" || (exploreMode === "auto" && page.text.length <= leafChars)) {
+        answers = await judge(item, {
+          ...page,
+          text: page.text.slice(0, exploreMode === "never" ? maxChars : leafChars),
+        });
+      } else {
+        // The page's own regions when it can be mapped (not for a selector,
+        // which already names the part to read); else the text in parts.
+        const graph =
+          (browsed && !(item.selector ?? selector) ? await mapGraph(callTool, tabId as number, page.title) : null) ??
+          graphFromText(page.text, { title: page.title ?? "" });
+        const opts = { questions, intent, context, mode: exploreMode, ...settings, leafChars };
+        let reading: PageReading = await readForQuestions(decide, graph, opts);
+        answers = await judge(item, { ...page, text: collapseRepeats(reading.text) });
+        // Still unsure: add the next-best regions and judge once more.
+        if (questions.some((q) => unsure(answers[q.key], cfg.minConfidence))) {
+          const wider = await rethink(decide, graph, reading, opts);
+          if (wider) {
+            const again = await judge(item, { ...page, text: collapseRepeats(wider.text) });
+            if (sureness(again, questions) > sureness(answers, questions)) {
+              answers = again;
+              reading = wider;
+            }
+          }
+        }
+        coverage = reading.coverage;
+      }
       return {
         ...row,
         status: "ok",
         answers,
+        ...(coverage ? { coverage } : {}),
         ...(returnChars > 0 ? { excerpt: page.text.slice(0, returnChars) } : {}),
       };
     } catch (err) {

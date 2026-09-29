@@ -619,10 +619,13 @@
   // Everything the Jev loop needs from one observation, in one message:
   // structured rows (no text format to parse), what is on screen, and where
   // the page is scrolled. Replaces read_page + get_page_text + tabs_context.
+  // With `map`, also the whole page as a tree of regions (buildPageMap), and
+  // each row says which region it sits in.
   function jevSnapshot(options: ContentRequests["jevSnapshot"]["req"]["options"] = {}): JevSnapshot {
     const maxRows = options.max_rows || 3000;
     const rows: ContentRow[] = [];
     let truncated = false;
+    const map = options.map ? buildPageMap() : null;
     walkRows({ filter: "interactive", depth: options.depth || 30 }, (el, row, indent) => {
       if (rows.length >= maxRows) {
         truncated = true;
@@ -632,6 +635,7 @@
       row.indent = indent.length;
       row.inView =
         r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+      if (map) row.region = map.regionOf(el);
       rows.push(row);
       return true;
     });
@@ -643,7 +647,266 @@
       truncated,
       text: visibleText(options.text_chars || 2000, options.full_text === true),
       scroll: { y: Math.round(scrollY), height, viewport: innerHeight },
+      ...(map ? { regions: map.regions, map_truncated: map.truncated } : {}),
     };
+  }
+
+  // --- Page map ---
+  //
+  // The whole page as a tree of regions, for the host's explorer
+  // (host/jev/explore.ts). A step decides on what is on screen and a question
+  // used to read one content root, capped, so on a big page Jev judged a
+  // subset without knowing it: a listing whose cards are each an <article>
+  // read as its first card. The map covers the whole document and cuts it
+  // where the page itself does: landmarks and named regions, heading
+  // sections, and runs of repeated siblings (cards, results, rows). The host
+  // scores regions, opens the promising ones, and only then decides.
+  //
+  // Hidden text (collapsed panels, closed tabs) is kept apart in `hidden`, for
+  // the same reason jev_assess reads it: ads keep their equipment lists there.
+  const MAP_MIN_CHARS = 40;
+  const MAP_NODE_CHARS = 20_000;
+  const MAP_TOTAL_CHARS = 300_000;
+  const MAP_SKIP = new Set(["script", "style", "noscript", "template", "svg", "iframe", "object"]);
+  // Siblings of these tags repeat on every page (paragraphs, links in a
+  // sentence) without being cards, so they never form a list.
+  const NOT_CARDS = new Set([
+    "p",
+    "span",
+    "b",
+    "i",
+    "em",
+    "strong",
+    "br",
+    "img",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "dd",
+    "dt",
+    "option",
+    "td",
+    "th",
+    "code",
+    "pre",
+    "sup",
+    "sub",
+    "blockquote",
+    "label",
+    "input",
+    "button",
+  ]);
+  const LANDMARK_TAGS = new Set(["main", "nav", "header", "footer", "aside", "form"]);
+  const LANDMARK_ROLES = new Set(["main", "navigation", "banner", "contentinfo", "complementary", "search", "form"]);
+
+  interface MapNode {
+    id: string;
+    parent: MapNode | null;
+    kind: PageRegion["kind"];
+    name: string;
+    el: Element | null;
+    text: string[];
+    hidden: string[];
+    chars: number;
+    children: number;
+    alias: MapNode | null;
+  }
+
+  // The heading level `el` starts, or 0. A wrapper holding only a heading
+  // counts too: MediaWiki wraps each <h2> in div.mw-heading with its [edit].
+  function headingLevel(el: Element): number {
+    const tag = el.tagName.toLowerCase();
+    if (/^h[1-6]$/.test(tag)) return Number(tag[1]);
+    if (el.getAttribute("role") === "heading") return Number(el.getAttribute("aria-level")) || 2;
+    const first = el.firstElementChild;
+    if (first && el.childElementCount <= 2 && /^h[1-6]$/i.test(first.tagName)) {
+      const own = (el.textContent ?? "").trim().length;
+      if (own <= (first.textContent ?? "").trim().length + 20) return Number(first.tagName[1]);
+    }
+    return 0;
+  }
+
+  // Children of `el` that are cards: at least three siblings sharing a tag
+  // and class, each with some structure and text of its own.
+  function repeatedItems(el: Element): Set<Element> {
+    const groups = new Map<string, Element[]>();
+    for (const child of el.children) {
+      const tag = child.tagName.toLowerCase();
+      if (NOT_CARDS.has(tag) || MAP_SKIP.has(tag) || headingLevel(child)) continue;
+      const key = `${tag}.${[...child.classList].sort().slice(0, 3).join(".")}`;
+      let list = groups.get(key);
+      if (!list) groups.set(key, (list = []));
+      list.push(child);
+    }
+    const out = new Set<Element>();
+    for (const list of groups.values()) {
+      if (list.length < 3) continue;
+      const cards = list.filter((c) => c.childElementCount > 0 && (c.textContent ?? "").trim().length >= 30);
+      if (cards.length >= 3) for (const c of cards) out.add(c);
+    }
+    return out;
+  }
+
+  function buildPageMap(): { regions: PageRegion[]; truncated: boolean; regionOf: (el: Element) => string } {
+    const nodes: MapNode[] = [];
+    const owner = new WeakMap<Element, MapNode>();
+    const shown = new Map<Element, boolean>();
+    let total = 0;
+    let truncated = false;
+
+    const make = (parent: MapNode | null, kind: PageRegion["kind"], name: string, el: Element | null): MapNode => {
+      const node: MapNode = {
+        id: `r${nodes.length}`,
+        parent,
+        kind,
+        name: name.replace(/\s+/g, " ").trim().slice(0, 80),
+        el,
+        text: [],
+        hidden: [],
+        chars: 0,
+        children: 0,
+        alias: null,
+      };
+      if (parent) parent.children++;
+      nodes.push(node);
+      return node;
+    };
+    const rendered = (el: Element): boolean => {
+      let v = shown.get(el);
+      if (v === undefined) {
+        v = el.closest('[aria-hidden="true"], [inert]')
+          ? false
+          : typeof el.checkVisibility === "function"
+            ? el.checkVisibility({ visibilityProperty: true })
+            : isVisible(el);
+        shown.set(el, v);
+      }
+      return v;
+    };
+    const addText = (node: MapNode, textNode: Node) => {
+      const value = (textNode.textContent ?? "").replace(/\s+/g, " ").trim();
+      const parent = textNode.parentElement;
+      if (!value || !parent) return;
+      if (total >= MAP_TOTAL_CHARS || node.chars >= MAP_NODE_CHARS) {
+        truncated = true;
+        return;
+      }
+      (rendered(parent) ? node.text : node.hidden).push(value);
+      node.chars += value.length + 1;
+      total += value.length + 1;
+    };
+    const kindOf = (el: Element): PageRegion["kind"] | null => {
+      const tag = el.tagName.toLowerCase();
+      const role = (el.getAttribute("role") || "").toLowerCase();
+      if (tag === "dialog" || role === "dialog" || role === "alertdialog") return "dialog";
+      if (LANDMARK_TAGS.has(tag) || LANDMARK_ROLES.has(role)) return "landmark";
+      if (REGION_TAGS.has(tag) || REGION_ROLES.has(role) || labelledByHeading(el)) return "region";
+      return null;
+    };
+
+    const walk = (el: Element, cur: MapNode, depth: number): void => {
+      if (depth > 200) return;
+      const cards = repeatedItems(el);
+      let list: MapNode | null = null;
+      let target = cur;
+      const sections: Array<{ level: number; node: MapNode }> = [];
+      const kids = [...(el.shadowRoot ? el.shadowRoot.childNodes : []), ...el.childNodes];
+      for (const child of kids) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          addText(target, child);
+          continue;
+        }
+        if (!(child instanceof Element)) continue;
+        const tag = child.tagName.toLowerCase();
+        if (MAP_SKIP.has(tag)) continue;
+
+        const level = cards.has(child) ? 0 : headingLevel(child);
+        if (level) {
+          while (sections.length && (sections[sections.length - 1]?.level ?? 0) >= level) sections.pop();
+          const node = make(sections[sections.length - 1]?.node ?? cur, "section", child.textContent ?? "", child);
+          sections.push({ level, node });
+          target = node;
+          list = null;
+          owner.set(child, node);
+          walk(child, node, depth + 1);
+          continue;
+        }
+        if (cards.has(child)) {
+          if (!list || list.parent !== target) list = make(target, "list", regionNameFor(el) || "", el);
+          const heading = child.querySelector("h1, h2, h3, h4, h5, h6");
+          const node = make(list, "item", regionNameFor(child) || heading?.textContent || "", child);
+          owner.set(child, node);
+          walk(child, node, depth + 1);
+          continue;
+        }
+        const kind = kindOf(child);
+        if (kind) {
+          const node = make(target, kind, regionNameFor(child) || child.getAttribute("aria-label") || "", child);
+          owner.set(child, node);
+          walk(child, node, depth + 1);
+          continue;
+        }
+        owner.set(child, target);
+        walk(child, target, depth + 1);
+      }
+    };
+
+    const root = make(null, "page", document.title || "", document.body);
+    if (document.body) {
+      owner.set(document.body, root);
+      walk(document.body, root, 0);
+    }
+
+    // Fold regions too small to judge on their own (a nav item, an empty
+    // wrapper) into their parent, children before parents so a chain of
+    // tiny ones collapses all the way up.
+    for (let i = nodes.length - 1; i > 0; i--) {
+      const node = nodes[i] as MapNode;
+      if (node.children > 0 || node.chars >= MAP_MIN_CHARS || node.kind === "dialog" || !node.parent) continue;
+      node.parent.text.push(...node.text);
+      node.parent.hidden.push(...node.hidden);
+      node.parent.chars += node.chars;
+      node.parent.children--;
+      node.alias = node.parent;
+    }
+    const live = (node: MapNode): MapNode => {
+      let n = node;
+      while (n.alias) n = n.alias;
+      return n;
+    };
+
+    const regions: PageRegion[] = [];
+    for (const node of nodes) {
+      if (node.alias) continue;
+      const region: PageRegion = {
+        id: node.id,
+        parent: node.parent ? live(node.parent).id : null,
+        kind: node.kind,
+        name: node.name,
+        text: node.text.join(" "),
+      };
+      if (node.hidden.length) region.hidden = node.hidden.join(" ");
+      if (node.el && node.el !== document.body) {
+        const r = node.el.getBoundingClientRect();
+        region.y = Math.round(r.top + scrollY);
+        region.inView = r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+      }
+      regions.push(region);
+    }
+
+    const regionOf = (el: Element): string => {
+      for (let e: Element | null = el; e;) {
+        const node = owner.get(e);
+        if (node) return live(node).id;
+        const host: Node = e.parentNode ?? e;
+        e = e.parentElement ?? (host instanceof ShadowRoot ? host.host : null);
+      }
+      return root.id;
+    };
+    return { regions, truncated, regionOf };
   }
 
   // --- Page text extraction ---

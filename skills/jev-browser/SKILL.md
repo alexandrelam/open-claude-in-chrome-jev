@@ -70,6 +70,14 @@ subgoals: [
 ]
 ```
 
+## Long pages: exploration and coverage
+
+A page too long for one Jev request (about 24k characters) is not cut any more. It is mapped into regions (sections, cards, panels, dialogs), Jev scores them against your questions or goal, opens the promising ones and answers from those, or from the passages it picked out of them. An answer that is still unsure gets one wider look. This is on by default (`explore: "auto"`) in `jev_navigate` and `jev_assess`.
+
+- Answers from an explored page carry `coverage`: `mode` (`whole`, `focused` or `notes`), regions and characters read out of the total. Low `chars_read` on a `yes: 0.05` means "not in what was read", not "not on the page". Ask a narrower question, or set `explore: "always"`.
+- A step that is unsure, or sees nothing useful on screen, maps the whole page and decides again, with the controls of the relevant regions on offer even when they're off screen. There's no need to add "scroll down" legs to reach a named control.
+- `explore: "never"` restores the old single read, cut at the length limit.
+
 ## Judging many items: jev_assess
 
 ### Build the items with fetch, not tabs
@@ -99,7 +107,7 @@ items.filter(Boolean);
 
 - Pool of **5–8 fetches** at a time. Sites with anti-bot protection (Leboncoin uses DataDome) can captcha or block the user's browser if you burst hundreds at once.
 - Set `items_script_url` (the listing), `items_script_timeout_ms` up to 120000 for long lists, and **`return_chars: 0`**.
-- Keep each item's text to what the questions need, about 2–3k characters: title, price, place, condition, description. Put the item's URL in `label` so it comes back in the rows.
+- Keep each item's text to what the questions need, about 2–3k characters: title, price, place, condition, description. Longer text is explored instead of cut, but costs more requests. Put the item's URL in `label` so it comes back in the rows.
 - Drop what the questions would reject anyway (wrong category, pro sellers, duplicates) inside the script, before judging.
 - Judge **the page that holds the answer**. When an aggregator truncates the text and links to a source site, resolve the source URL in the script and fetch that.
 - Use `url` items only when a page needs rendering or a click to show its content.

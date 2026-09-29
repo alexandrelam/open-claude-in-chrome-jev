@@ -2355,6 +2355,7 @@ const toolHandlers: ToolHandlers = {
           max_rows: args.max_rows,
           text_chars: args.text_chars,
           full_text: args.full_text,
+          map: args.map,
         },
       });
     } catch (e) {

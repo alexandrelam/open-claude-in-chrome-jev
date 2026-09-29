@@ -22,6 +22,13 @@ const QUESTION = z.object({
     .describe("score: ordered labels, low to high, e.g. ['Poor','Fair','Good','Great']."),
 });
 
+const EXPLORE = z
+  .enum(["auto", "always", "never"])
+  .optional()
+  .describe(
+    "How a page too long for one Jev request is read. auto (default): read whole when it fits, else explored — the page is mapped into regions (sections, cards, panels), Jev scores them, opens the promising ones and answers from those, or from the passages it picked out of them; unsure answers get one wider look. The answer then carries `coverage` (regions and characters read of the total). always: explore even a short page. never: the old single read, cut at the length limit.",
+  );
+
 const FILL_DEFAULTS =
   "Where a choice field (select, combobox, radio, checkbox) has no value in `values`, any valid option is acceptable and Jev picks the first real one. Never applies to free-text fields, which still return needs_value. Use it for forms whose choices you don't care about, e.g. test data.";
 
@@ -68,7 +75,7 @@ const NAVIGATE_SHAPE = {
     .string()
     .optional()
     .describe(
-      'Observable condition for `goal`, e.g. "an invoice detail page with a total is shown". Checked on every step. Prefer criteria about WHERE you are over criteria about page content — "the revision history view is open" reads far more reliably than "a list of revisions with dates is shown", because the check sees the page\'s controls plus a short text excerpt rather than the full body. When the app puts state in the URL, say so as key=value ("new=true in the URL"): that part is checked exactly. Required with `goal`; use the per-leg field inside `subgoals` instead.',
+      'Observable condition for `goal`, e.g. "an invoice detail page with a total is shown". Checked on every step. Prefer criteria about WHERE you are over criteria about page content — "the revision history view is open" reads far more reliably than "a list of revisions with dates is shown", because the check sees the page\'s controls plus a short text excerpt rather than the full body (use `questions` for content: they read the whole page). When the app puts state in the URL, say so as key=value ("new=true in the URL"): that part is checked exactly. Required with `goal`; use the per-leg field inside `subgoals` instead.',
     ),
   values: z
     .record(z.string())
@@ -109,6 +116,9 @@ const NAVIGATE_SHAPE = {
     .describe(
       "Permit actions that look destructive or irreversible (pay, delete, send, publish, submit). Default false, which stops and asks instead. Only set this when the user has asked for that specific action.",
     ),
+  explore: EXPLORE.describe(
+    `${EXPLORE.description} For steps: when Jev is unsure or sees nothing that helps on screen, it maps the whole page and decides again with the controls of the regions the goal is about, on screen or not, before handing back.`,
+  ),
 } satisfies z.ZodRawShape;
 
 const ASSESS_SHAPE = {
@@ -181,7 +191,12 @@ const ASSESS_SHAPE = {
     .describe(
       "CSS selector of the part of each page to read. Default: <main>, else the body. Hidden text (collapsed panels, closed tabs) is read too.",
     ),
-  max_chars: z.number().optional().describe("Page text sent to Jev per item (default 4000)."),
+  max_chars: z
+    .number()
+    .optional()
+    .describe(
+      "Page text read in one request per item with explore: never (default 4000). Otherwise a page is read whole up to the explorer's budget (~24000 characters) and explored past it.",
+    ),
   return_chars: z
     .number()
     .optional()
@@ -202,6 +217,7 @@ const ASSESS_SHAPE = {
     .boolean()
     .optional()
     .describe("For items with a `goal`: permit actions that look irreversible. Default false."),
+  explore: EXPLORE,
 } satisfies z.ZodRawShape;
 
 const DECIDE_SHAPE = {

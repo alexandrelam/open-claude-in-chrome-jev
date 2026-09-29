@@ -56,6 +56,22 @@ export interface Row {
   options: RowOption[] | null;
   /** Whether the element is on screen. Only a jev_snapshot observation knows. */
   inView?: boolean | undefined;
+  /** The page-map region it sits in, when the observation asked for a map. */
+  region?: string | undefined;
+}
+
+/** One region of the page map, as jev_snapshot sends it (content.ts buildPageMap). */
+export interface PageRegion {
+  id: string;
+  parent: string | null;
+  kind: string;
+  name: string;
+  /** Rendered text the region holds itself, not counting its child regions. */
+  text: string;
+  /** Text in the DOM but not rendered: collapsed panels, closed tabs. */
+  hidden?: string | undefined;
+  y?: number | undefined;
+  inView?: boolean | undefined;
 }
 
 /** Scroll position of the page, from jev_snapshot. */
@@ -74,6 +90,10 @@ export interface Observation {
   truncated: boolean;
   excerpt: string;
   scroll?: ScrollState | null;
+  /** The whole page as regions, when the observation asked for a map. */
+  regions?: PageRegion[] | undefined;
+  /** The map hit its size cap, so some of the page's text is missing from it. */
+  mapTruncated?: boolean | undefined;
 }
 
 /** An observation, or why one could not be taken. */
@@ -157,7 +177,16 @@ export interface JevConfig {
   allowedDomains: string[] | null;
   blockedDomains: string[];
   tracesDir: string;
+  /** Regions kept per exploration round besides the clearly relevant ones. */
+  exploreBeam?: number | undefined;
+  /** Most score-and-expand rounds one exploration may take. */
+  exploreMaxRounds?: number | undefined;
+  /** Page text read in one request; a page longer than this is explored. */
+  exploreLeafChars?: number | undefined;
 }
+
+/** When a long page is explored region by region instead of read in one shot. */
+export type ExploreMode = "auto" | "always" | "never";
 
 /** One of Claude's own questions, as jev_assess and jev_navigate accept them. */
 export interface ClaudeQuestion {

@@ -6,7 +6,15 @@
 // carries it out through the ordinary tools, and the extension performs it in
 // the real profile. Jev never sees a selector and never returns one.
 
-import { observe, hasJevTools, observationSignature, type ObserveOptions, isToolError, resultText } from "./observe.ts";
+import {
+  observe,
+  hasJevTools,
+  observationSignature,
+  type ObserveOptions,
+  isToolError,
+  resultText,
+  usableRows,
+} from "./observe.ts";
 import {
   OPERATIONS,
   availableOperations,
@@ -22,6 +30,16 @@ import {
   isOperation,
 } from "./actions.ts";
 import { shortlistRows, renderRow } from "./shortlist.ts";
+import {
+  buildGraph,
+  exploreForAction,
+  exploreSettings,
+  readForQuestions,
+  rethink,
+  traceOf,
+  type Coverage,
+  type PageReading,
+} from "./explore.ts";
 import { termsFrom, lexicalScore, prefilter } from "./relevance.ts";
 import { buildQuestions, questionsError, compactAnswer } from "./questions.ts";
 import { EVIDENCE_SUFFIX, splitPassages, numberedText, evidenceQuestions, pickEvidence } from "./evidence.ts";
@@ -38,6 +56,8 @@ import type {
   CallTool,
   ClaudeQuestion,
   CompactAnswer,
+  Decide,
+  ExploreMode,
   JevClient,
   JevConfig,
   JevQuestions,
@@ -84,6 +104,7 @@ export interface NavigateInput {
   max_ms?: number | undefined;
   min_confidence?: number | undefined;
   allow_sensitive?: boolean | undefined;
+  explore?: ExploreMode | undefined;
 }
 
 /** Why a step or run stopped short. */
@@ -135,6 +156,8 @@ interface RunContext {
   browserMs: number;
   jevMs: number;
   settleMs: number;
+  /** When a page too big for one request is explored region by region. */
+  explore: ExploreMode;
 }
 
 /** The next leg's first decision, answered by this leg's last request. */
@@ -194,6 +217,8 @@ interface LegSummary {
   answers?: Record<string, CompactAnswer | null>;
   /** Set when the answers describe a page the leg did not finish on. */
   answers_note?: string;
+  /** How much of the page the answers rest on. */
+  coverage?: Coverage;
 }
 
 /** What jev_navigate returns. */
@@ -207,6 +232,8 @@ export interface NavigateResult {
   answers?: Record<string, CompactAnswer | null>;
   /** Set when `answers` describe the page where a leg stopped the run. */
   answers_note?: string;
+  /** How much of the page `answers` rest on: all of it, the regions explored, or passages chosen from them. */
+  coverage?: Coverage;
   blockers?: Blockers;
   remaining_subgoals?: SubgoalInput[];
   page_excerpt?: { url: string; title: string; text: string; interactive: string[] } | null;
@@ -234,6 +261,8 @@ export interface DecideOnceResult {
   url?: string;
   title?: string;
   jev_ms?: number;
+  /** The proposal came from a second look over the regions the goal is about. */
+  explored?: boolean;
   usage?: unknown;
 }
 
@@ -759,10 +788,11 @@ export async function decideOnce(
 ): Promise<DecideOnceResult> {
   const { tabId, goal, success_criteria: successCriteria, values, allow_sensitive } = args;
   const fillDefaults = Boolean(args.fill_defaults);
-  const { obs, failure } = await observeOrFail(callTool, tabId, cfg);
-  if (failure) return { status: failure.status, reason: failure.reason };
+  const observed = await observeOrFail(callTool, tabId, cfg);
+  if (observed.failure) return { status: observed.failure.status, reason: observed.failure.reason };
+  let obs = observed.obs;
 
-  const short = await shortlistRows(obs.rows, {
+  let short = await shortlistRows(obs.rows, {
     goal,
     successCriteria,
     values,
@@ -770,9 +800,40 @@ export async function decideOnce(
     pageUrl: obs.url,
     decide: (s, q) => client.decide(s, q),
   });
-  const { state, questions, idMap } = buildRequest(obs, short.rows, { goal, successCriteria, values, fillDefaults });
-  const { answers, ms, usage } = await client.decide(state, questions);
-  const verdict = validate(answers, idMap, cfg, { allowSensitive: allow_sensitive, values, fillDefaults });
+  const first = buildRequest(obs, short.rows, { goal, successCriteria, values, fillDefaults });
+  let idMap = first.idMap;
+  const firstRes = await client.decide(first.state, first.questions);
+  let { answers, ms } = firstRes;
+  let verdict = validate(answers, idMap, cfg, { allowSensitive: allow_sensitive, values, fillDefaults });
+  // The same second look the loop takes before handing back (decideExplored).
+  let explored = false;
+  if (
+    !verdict.ok &&
+    (verdict.status === "blocked" || (verdict.confidence ?? 1) < cfg.minConfidence) &&
+    hasJevTools(callTool)
+  ) {
+    const ctx: RunContext = {
+      obs,
+      deadline: Date.now() + cfg.maxMs,
+      decisionNo: 0,
+      actionNo: 0,
+      browserMs: 0,
+      jevMs: 0,
+      settleMs: 0,
+      explore: "auto",
+    };
+    const sub: Subgoal = { goal, successCriteria, values: values ?? {}, fillDefaults };
+    const deeper = await decideExplored(callTool, client, cfg, ctx, tabId, sub, {
+      allowSensitive: Boolean(allow_sensitive),
+      history: [],
+    });
+    ms += ctx.jevMs;
+    if (deeper && (deeper.verdict.ok || (deeper.verdict.confidence ?? 0) > (verdict.confidence ?? 0))) {
+      ({ obs, short, answers, verdict } = deeper);
+      idMap = deeper.request.idMap;
+      explored = true;
+    }
+  }
 
   return {
     status: verdict.ok ? "proposed" : verdict.status,
@@ -797,7 +858,8 @@ export async function decideOnce(
     url: obs.url,
     title: obs.title,
     jev_ms: ms,
-    usage,
+    ...(explored ? { explored: true } : {}),
+    usage: firstRes.usage,
   };
 }
 
@@ -927,6 +989,8 @@ async function runSubgoal(
   // failed from this page is never tried a second time.
   const recovered: string[] = [];
   const failedActions = new Map<string, string>();
+  // Page states already explored, so an unsure page is explored once, not per step.
+  const explored = new Set<string>();
   const canRecover = (why: string): boolean => {
     if (recovered.length >= MAX_RECOVERIES) return false;
     recovered.push(why);
@@ -1038,6 +1102,40 @@ async function runSubgoal(
       verdict = validate(answers, request.idMap, cfg, { allowSensitive, values, fillDefaults });
     }
 
+    // Unsure, or sure that nothing offered helps: before handing back, map
+    // the whole page, find the regions the goal is about, and decide again
+    // with their controls on offer, on screen or not. Once per page state.
+    let exploreTrace: Record<string, unknown> | null = null;
+    if (
+      !carried &&
+      !verdict.ok &&
+      (verdict.status === "blocked" || (verdict.confidence ?? 1) < cfg.minConfidence) &&
+      (answers.satisfied?.noul ?? 0) <= 0.5 &&
+      ctx.explore !== "never" &&
+      hasJevTools(callTool) &&
+      !explored.has(observationSignature(obs))
+    ) {
+      explored.add(observationSignature(obs));
+      try {
+        const deeper = await decideExplored(callTool, client, cfg, ctx, tabId, sub, {
+          allowSensitive,
+          history: history.slice(-3),
+        });
+        if (deeper) {
+          exploreTrace = { ...deeper.trace, verdict: { ok: deeper.verdict.ok, reason: deeper.verdict.reason ?? null } };
+          if (deeper.verdict.ok || (deeper.answers.satisfied?.noul ?? 0) > 0.5) {
+            ({ short, request, answers, verdict } = deeper);
+            obs = deeper.obs;
+            ctx.obs = obs;
+            inputTokens += deeper.inputTokens;
+          }
+        }
+      } catch (err) {
+        if (err instanceof BudgetExceeded) return stop("limit_reached", err.message, { fatal: true });
+        exploreTrace = { error: errorMessage(err) };
+      }
+    }
+
     const contradiction = urlContradicts(successCriteria, obs.url);
     const satisfied = contradiction ? 0 : (answers.satisfied?.noul ?? 0);
 
@@ -1059,6 +1157,7 @@ async function runSubgoal(
       target_ref: verdict.row?.ref ?? null,
       jev_ms: jevMs,
       input_tokens: inputTokens,
+      ...(exploreTrace ? { explore: exploreTrace } : {}),
     });
 
     // The success check now governs completion, so it is tested before the
@@ -1309,6 +1408,91 @@ async function runSubgoal(
 }
 
 /**
+ * One decision made the long way: the whole page mapped into regions, the
+ * regions the goal is about found by exploration (explore.ts), and the step
+ * decided again with their controls on offer, on screen or not, and their
+ * text as the excerpt. Refs are stable across observations, so the rows it
+ * offers are acted on like any others. Null when the page cannot be mapped.
+ */
+async function decideExplored(
+  callTool: CallTool,
+  client: JevClient,
+  cfg: JevConfig,
+  ctx: RunContext,
+  tabId: number,
+  sub: Subgoal,
+  { allowSensitive, history }: { allowSensitive: boolean; history: unknown[] },
+): Promise<{
+  obs: Observation;
+  short: Shortlist;
+  request: StepRequest;
+  answers: Answers;
+  verdict: Verdict;
+  inputTokens: number;
+  trace: Record<string, unknown>;
+} | null> {
+  const { goal, successCriteria, values, fillDefaults } = sub;
+  const t = Date.now();
+  const mapped = await observeOrFail(callTool, tabId, cfg, { map: true });
+  ctx.browserMs += Date.now() - t;
+  if (mapped.failure || !mapped.obs.regions) return null;
+  const obs = mapped.obs;
+  let inputTokens = 0;
+  const decide: Decide = async (state, qs) => {
+    const t0 = Date.now();
+    try {
+      const res = await client.decide(state, qs);
+      inputTokens += tokensOf(res.usage);
+      return res;
+    } finally {
+      ctx.jevMs += Date.now() - t0;
+    }
+  };
+  const graph = buildGraph(obs.regions ?? [], obs.allRows, { title: obs.title, truncated: Boolean(obs.mapTruncated) });
+  const found = await exploreForAction(decide, graph, {
+    intent: `${goal ?? ""} Done when: ${successCriteria ?? ""}`.trim(),
+    ...exploreSettings(cfg),
+  });
+
+  // The focus regions' controls, plus whatever is on screen, in page order.
+  const inFocus = new Set(found.rows);
+  let rows = usableRows(obs.allRows.filter((r) => inFocus.has(r) || r.inView));
+  if (rows.length > cfg.maxRows) {
+    // Narrowed by the goal's words, with on-screen-ness forgotten: being off
+    // screen is exactly what these rows are allowed to be.
+    const byRef = new Map(rows.map((r) => [r.ref, r]));
+    const kept = prefilter(
+      rows.map((r) => ({ ...r, inView: undefined })),
+      { goal, successCriteria, values, limit: cfg.maxRows, pageUrl: obs.url },
+    ).rows;
+    rows = kept.map((r) => byRef.get(r.ref) as Row);
+  }
+  const request = buildRequest({ ...obs, excerpt: found.excerpt || obs.excerpt }, rows, {
+    goal,
+    successCriteria,
+    values,
+    fillDefaults,
+    history,
+  });
+  const { answers } = await decide(request.state, request.questions);
+  const verdict = validate(answers, request.idMap, cfg, { allowSensitive, values, fillDefaults });
+  return {
+    obs,
+    short: {
+      rows,
+      cut: obs.allRows.length - rows.length,
+      scored: true,
+      sections: found.exploration.focus.length,
+    },
+    request,
+    answers,
+    verdict,
+    inputTokens,
+    trace: { ...traceOf({ exploration: found.exploration, text: found.excerpt }), rows_offered: rows.length },
+  };
+}
+
+/**
  * The next leg's first decision, already answered by this leg's last request.
  *
  * Carried only when it is usable as-is: it passed the whole gate, or the next
@@ -1360,18 +1544,28 @@ export function handbackRows(
     .map(({ r }) => renderRow(r, r.ref));
 }
 
-// How much page text questions are asked of. A step decides on 300 characters
-// of what is in view, because more prose dilutes an ACTION decision; questions
-// are about the page's content, which is often longer and below the fold.
+// How much page text questions are asked of when the extension cannot map the
+// page (one that predates jev_snapshot's `map`). With a map, the whole page is
+// read when it fits exploreLeafChars and explored region by region when it
+// does not (explore.ts), so a fact below the first few thousand characters,
+// or in the twentieth card of a listing, is no longer out of reach.
 const ANSWER_TEXT_CHARS = 6000;
 // How much of that text comes back to Claude in page_excerpt.
 const EXCERPT_RETURN_CHARS = 1500;
 
+/** Mean confidence of Claude's questions' answers, to compare two readings. */
+function meanConfidence(got: Answers, questions: readonly ClaudeQuestion[]): number {
+  if (!questions.length) return 1;
+  return questions.reduce((a, q) => a + (got[q.key]?.confidence ?? 0), 0) / questions.length;
+}
+
 /**
- * Ask Claude's questions, and a final check, about the page as it is now, in
- * one request. The page is read whole and cut into numbered passages, so each
- * answer comes back with the passage it rests on, quoted verbatim, as
- * jev_assess does. Throws when the page cannot be read or Jev cannot answer.
+ * Ask Claude's questions, and a final check, about the page as it is now. The
+ * page is read whole, or explored when it is too long for one request, then
+ * cut into numbered passages so each answer comes back with the passage it
+ * rests on, quoted verbatim, as jev_assess does. An explored reading that
+ * leaves an answer unsure gets one wider look. Throws when the page cannot be
+ * read or Jev cannot answer.
  */
 async function answerOnPage(
   callTool: CallTool,
@@ -1381,49 +1575,88 @@ async function answerOnPage(
   trace: Trace,
   tabId: number,
   { questions, finalCheck, leg }: { questions: ClaudeQuestion[] | null; finalCheck: string | null; leg?: number },
-): Promise<{ answers: Record<string, CompactAnswer | null> | null; verified: number | null; obs: Observation }> {
+): Promise<{
+  answers: Record<string, CompactAnswer | null> | null;
+  verified: number | null;
+  obs: Observation;
+  coverage: Coverage | null;
+}> {
   const t = Date.now();
   const { obs, failure } = await observeOrFail(callTool, tabId, cfg, {
     excerptChars: ANSWER_TEXT_CHARS,
     fullText: true,
+    map: ctx.explore !== "never",
   });
   ctx.browserMs += Date.now() - t;
   if (!obs || failure) throw new Error(failure?.reason ?? "the page could not be read");
 
-  const passages = questions ? splitPassages(obs.excerpt) : [];
-  const jevQuestions: JevQuestions = {};
-  if (questions) {
-    Object.assign(jevQuestions, buildQuestions(questions));
-    if (passages.length) Object.assign(jevQuestions, evidenceQuestions(questions, passages.length));
-  }
-  if (finalCheck) {
-    jevQuestions["verified"] = {
-      type: "noul",
-      instructions: `Is ALL of this true of the page right now: ${finalCheck}`,
-      criteria: {
-        true: "Every part of the intended end state is visibly in place",
-        false: "Some part of it is missing, or was undone",
-      },
-    };
-  }
+  const decide: Decide = async (state, qs) => {
+    const t0 = Date.now();
+    try {
+      return await client.decide(state, qs);
+    } finally {
+      ctx.jevMs += Date.now() - t0;
+    }
+  };
+  const intent = [finalCheck ? `Check whether: ${finalCheck}` : "", ...(questions ?? []).map((q) => q.question)]
+    .filter(Boolean)
+    .join(" ");
+  const graph = obs.regions
+    ? buildGraph(obs.regions, obs.allRows, { title: obs.title, truncated: Boolean(obs.mapTruncated) })
+    : null;
+  const readOpts = { questions, intent, mode: ctx.explore, ...exploreSettings(cfg) };
+  let page: PageReading | null = graph ? await readForQuestions(decide, graph, readOpts) : null;
+
   // The rows the questions name, when the page has more than fit.
-  const rows = prefilter(obs.rows, {
-    goal: [finalCheck, ...(questions ?? []).map((q) => q.question)].filter(Boolean).join(" "),
-    limit: cfg.maxRows,
-    pageUrl: obs.url,
-  }).rows;
-  const t2 = Date.now();
-  const { answers: got } = await client.decide(
-    {
-      ...(finalCheck ? { intended_end_state: finalCheck } : {}),
-      url: obs.url,
-      title: obs.title,
-      page_text: passages.length ? numberedText(passages) : obs.excerpt,
-      elements: rows.map((r, k) => renderRow(r, `e${k + 1}`)),
-    },
-    jevQuestions,
-  );
-  ctx.jevMs += Date.now() - t2;
+  const rows = prefilter(obs.rows, { goal: intent, limit: cfg.maxRows, pageUrl: obs.url }).rows;
+  const ask = async (text: string): Promise<{ got: Answers; passages: string[] }> => {
+    const passages = questions ? splitPassages(text) : [];
+    const jevQuestions: JevQuestions = {};
+    if (questions) {
+      Object.assign(jevQuestions, buildQuestions(questions));
+      if (passages.length) Object.assign(jevQuestions, evidenceQuestions(questions, passages.length));
+    }
+    if (finalCheck) {
+      jevQuestions["verified"] = {
+        type: "noul",
+        instructions: `Is ALL of this true of the page right now: ${finalCheck}`,
+        criteria: {
+          true: "Every part of the intended end state is visibly in place",
+          false: "Some part of it is missing, or was undone",
+        },
+      };
+    }
+    const { answers: got } = await decide(
+      {
+        ...(finalCheck ? { intended_end_state: finalCheck } : {}),
+        url: obs.url,
+        title: obs.title,
+        page_text: passages.length ? numberedText(passages) : text,
+        elements: rows.map((r, k) => renderRow(r, `e${k + 1}`)),
+      },
+      jevQuestions,
+    );
+    return { got, passages };
+  };
+
+  let { got, passages } = await ask(page?.text ?? obs.excerpt);
+  // Still unsure after exploring: add the next-best regions and ask once more,
+  // keeping whichever reading answered more surely.
+  if (
+    graph &&
+    page?.exploration &&
+    questions &&
+    questions.some((q) => (got[q.key]?.confidence ?? 0) < cfg.minConfidence)
+  ) {
+    const wider = await rethink(decide, graph, page, readOpts);
+    if (wider) {
+      const again = await ask(wider.text);
+      if (meanConfidence(again.got, questions) > meanConfidence(got, questions)) {
+        page = wider;
+        ({ got, passages } = again);
+      }
+    }
+  }
 
   let answers: Record<string, CompactAnswer | null> | null = null;
   if (questions) {
@@ -1445,8 +1678,9 @@ async function answerOnPage(
     verified,
     answers,
     url: obs.url,
+    ...(page ? { explore: traceOf(page) } : {}),
   });
-  return { answers, verified, obs };
+  return { answers, verified, obs, coverage: page?.coverage ?? null };
 }
 
 /** The full loop over one or more subgoals. Backs the jev_navigate tool. */
@@ -1510,6 +1744,7 @@ export async function navigate(
     browserMs: 0,
     jevMs: 0,
     settleMs: 0,
+    explore: args.explore ?? "auto",
   };
   const legs: LegSummary[] = [];
   const allSteps: ActionStep[] = [];
@@ -1522,6 +1757,7 @@ export async function navigate(
   let stoppedLeg: Subgoal | null = null;
   let answers: Record<string, CompactAnswer | null> | null = null;
   let answersNote: string | null = null;
+  let coverage: Coverage | null = null;
 
   const finish = (): NavigateResult => {
     const obs = ctx.obs;
@@ -1553,6 +1789,7 @@ export async function navigate(
       // read_page just to find out where the loop left the tab.
       ...(answers ? { answers } : {}),
       ...(answers && answersNote ? { answers_note: answersNote } : {}),
+      ...(answers && coverage ? { coverage } : {}),
       ...(blockers ? { blockers } : {}),
       ...(remaining ? { remaining_subgoals: remaining } : {}),
       page_excerpt: obs
@@ -1637,6 +1874,7 @@ export async function navigate(
           leg: idx + 1,
         });
         if (got.answers) summary.answers = got.answers;
+        if (got.answers && got.coverage) summary.coverage = got.coverage;
         if (leg.status !== "done") summary.answers_note = "Answered about the page where this leg stopped.";
       } catch (err) {
         summary.reason = `${summary.reason ? `${summary.reason} ` : ""}Its questions could not be answered: ${errorMessage(err)}`;
@@ -1704,6 +1942,7 @@ export async function navigate(
       });
       ctx.obs = got.obs;
       answers = got.answers;
+      coverage = got.coverage;
       if (status !== "done" && status !== "partial") {
         answersNote = stoppedLeg
           ? `Answered about the page where subgoal ${subgoals.indexOf(stoppedLeg) + 1} stopped, not the page the run was meant to reach.`

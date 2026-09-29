@@ -620,7 +620,10 @@ await check("one snapshot call per observation, and none of the old three", asyn
   const client = fakeClient([{ operation: choice("BLOCKED", 0.9), sensitive: noul(0), satisfied: notYet }]);
   await navigate(browser.callTool, client, CFG, { tabId: 1, goal: "g", success_criteria: "s" });
   const names = browser.calls.map((c) => c.name);
-  eq(names.filter((n) => n === "jev_snapshot").length, 1, "one snapshot");
+  // A BLOCKED step also takes one mapped look (decideExplored) before handing
+  // back; that is a second decision, not a second observation of the step.
+  const plain = browser.calls.filter((c) => c.name === "jev_snapshot" && !c.args["map"]);
+  eq(plain.length, 1, "one snapshot");
   assert(
     !names.some((n) => ["read_page", "get_page_text", "tabs_context_mcp"].includes(n)),
     `old tools called: ${names.join(",")}`,

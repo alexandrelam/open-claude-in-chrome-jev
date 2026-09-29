@@ -42,7 +42,9 @@ function hardSplit(s: string, max: number): string[] {
 }
 
 /**
- * The page text as passages, in order. Sentences and bullets first, then
+ * The page text as passages, in order. Sentences, lines and bullets first
+ * (a line break is always a boundary: a passage holding one would print as
+ * two lines under one number), then
  * short fragments merged forward and long runs cut, and finally neighbours
  * paired until the count fits a choice question (one option is kept for
  * "none").
@@ -56,7 +58,7 @@ export function splitPassages(
   }: { max?: number; min?: number; limit?: number } = {},
 ): string[] {
   const raw = textOf(text)
-    .split(/(?<=[.!?…])\s+(?=\S)|\s+(?=[•·▪◦–-]\s)/)
+    .split(/(?<=[.!?…])\s+(?=\S)|\s*\n\s*|\s+(?=[•·▪◦–-]\s)/)
     .map((s) => s.trim())
     .filter(Boolean)
     .flatMap((s) => hardSplit(s, max));
